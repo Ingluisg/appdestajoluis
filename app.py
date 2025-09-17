@@ -1,209 +1,355 @@
+# app.py
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from io import BytesIO
+from datetime import datetime, date, time as _time
+import os
+import unicodedata
 
-# Rutas de los archivos
-EXCEL_PATH = "TIEMPOS_DESTAJO_CORE.xlsx"
-
-# Cargar hojas
-@st.cache_data
-def load_excel(path):
-    xls = pd.ExcelFile(path)
-    return {sheet: xls.parse(sheet) for sheet in xls.sheet_names}
-
-data = load_excel(EXCEL_PATH)
-
-# --- Configuración de página ---
-st.set_page_config(page_title="App de Destajo — Núcleo", layout="wide")
+# ====================== Ajustes de página ======================
+st.set_page_config(page_title="App de Destajo — Núcleo (Móvil)", layout="wide")
 st.title("App de Destajo — Núcleo")
+st.caption("Optimizada para móviles. Solo **Tiempos**, **Tabla** y **Calendario**. "
+           "Captura igual al Excel y cálculos de destajo sin añadir columnas nuevas.")
 
-# Hojas disponibles
-tabla_df = data["Tabla"]
-calendario_df = data["Calendario"]
-tiempos_df = data["Tiempos"]
+# ====================== Constantes ======================
+EXCEL_PATH = "TIEMPOS_DESTAJO_CORE.xlsx"
+BITACORA_PATH = "bitacora_cambios.csv"
+VALID_SHEETS = ["Tiempos", "Tabla", "Calendario"]
 
-# --- Sección de captura ---
-# ---------- Captura de destajo (robusta) ----------
-st.subheader("Captura de destajo")
+MASTER_USER = "master"
+MASTER_PASS = st.secrets.get("MASTER_PASS", "master1234")  # define en Secrets para producción
 
-def ilike(s): return str(s).strip().lower()
+# ====================== Utilidades generales ======================
+def _normalize(s: str) -> str:
+    """lower + trim + sin acentos (para matching robusto)."""
+    s = str(s).strip().lower()
+    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    return s
 
-# 1) Normalizar TABLA (cabeceras en fila 0, datos desde fila 2)
-raw_tabla = data["Tabla"]
-tabla_headers = raw_tabla.iloc[0].tolist()         # fila con títulos “reales”
-tabla_norm = raw_tabla.iloc[2:].copy()
-tabla_norm.columns = tabla_headers
-
-# Columnas de departamentos = todas las que NO son clave/descripcion y contienen números
-ignore = {"clave","descripción","descripcion","modelo","observaciones","obs"}
-deptos = []
-for c in tabla_norm.columns:
-    name = ilike(c)
-    if name not in ignore and c not in ("CLAVE","DESCRIPCION"):
-        try:
-            if pd.to_numeric(tabla_norm[c], errors="coerce").notna().any():
-                deptos.append(str(c))
-        except Exception:
-            pass
-deptos = sorted(list(dict.fromkeys(deptos)))  # únicos
-
-# 2) Claves disponibles
-claves = [c for c in tabla_norm["CLAVE"].dropna().astype(str).tolist() if c.strip()]
-
-# 3) Calendario (fecha y horas)
-cal = data["Calendario"]
-# detectar columna de fecha en Calendario
-def detect_fecha_column(df):
-    for col in df.columns:
-        try:
-            if pd.api.types.is_datetime64_any_dtype(df[col]):
-                return col
-        except Exception:
-            pass
-    for col in df.columns:
-        if "fecha" in ilike(col) or "día" in ilike(col) or "dia" in ilike(col):
-            return col
-    for col in df.columns:
-        try:
-            if pd.to_datetime(df[col], errors="coerce").notna().sum()>0:
-                return col
-        except Exception:
-            pass
-    return None
-
-fcol = detect_fecha_column(cal)
-dias = []
-if fcol:
-    dias = sorted(pd.to_datetime(cal[fcol], errors="coerce").dt.date.dropna().unique().tolist())
-
-def find_col(df, keywords):
-    ks = [ilike(k) for k in keywords]
-    for c in df.columns:
-        name = ilike(c)
-        if any(k in name for k in ks):
+def match_col(cols, target):
+    """Devuelve la columna de 'cols' que matchea 'target' de forma insensible a mayúsculas/acentos/espacios."""
+    t = _normalize(target)
+    for c in cols:
+        if _normalize(c) == t:
             return c
     return None
 
-hora_i_col = find_col(cal, ["hora i","hora inicio","inicio","entrada"])
-hora_f_col = find_col(cal, ["hora f","hora fin","fin","salida"])
+def detect_fecha_column(df: pd.DataFrame):
+    # por dtype datetime
+    for c in df.columns:
+        try:
+            if pd.api.types.is_datetime64_any_dtype(df[c]):
+                return c
+        except Exception:
+            pass
+    # por nombre
+    for c in df.columns:
+        name = _normalize(c)
+        if "fecha" in name or "dia" in name or "día" in name:
+            return c
+    # fallback parseable
+    for c in df.columns:
+        try:
+            if pd.to_datetime(df[c], errors="coerce").notna().sum() > 0:
+                return c
+        except Exception:
+            pass
+    return None
 
-# 4) Tarifa $/hr por DEPTO desde hoja Tiempos
-t_raw = data["Tiempos"]
-ti_heads = t_raw.iloc[0]
-ti = t_raw.iloc[1:].copy()
-ti.columns = ti_heads
-tmp = ti[["DEPARTAMENTOS","$/hr"]].dropna()
-tmp["DEPARTAMENTOS"] = tmp["DEPARTAMENTOS"].astype(str).str.strip()
-rate_map = tmp.groupby("DEPARTAMENTOS")["$/hr"].mean().to_dict()
+def detect_time_column(df: pd.DataFrame, key_words=("hora i", "hora inicio", "inicio", "entrada")):
+    lk = [_normalize(k) for k in key_words]
+    for c in df.columns:
+        name = _normalize(c)
+        if any(k in name for k in lk):
+            return c
+    return None
 
-# ---------- Formulario ----------
-c1,c2,c3 = st.columns(3)
-clave = c1.selectbox("CLAVE", claves, placeholder="Selecciona la clave")
-depto = c2.selectbox("DEPTO", deptos, placeholder="Selecciona el depto")
-empleado = c3.text_input("Empleado / Operador")
+def detect_time_end_column(df: pd.DataFrame, key_words=("hora f", "hora fin", "fin", "salida")):
+    lk = [_normalize(k) for k in key_words]
+    for c in df.columns:
+        name = _normalize(c)
+        if any(k in name for k in lk):
+            return c
+    return None
 
-c4,c5,c6 = st.columns(3)
-if dias:
-    dia = c4.selectbox("Día (desde Calendario)", options=dias, index=len(dias)-1)
-else:
-    dia = c4.date_input("Día")
+@st.cache_data
+def load_book(path):
+    xls = pd.ExcelFile(path)
+    # solo cargamos las 3 hojas relevantes si existen
+    data = {s: xls.parse(s) for s in xls.sheet_names if s in VALID_SHEETS}
+    return data
 
-# Horas desde Calendario si existen
-from datetime import time as _time
-def_hora_i, def_hora_f = _time(8,0), _time(17,0)
+def to_excel_bytes(dfs: dict):
+    """Escribe SOLO las hojas válidas en el mismo orden."""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name in VALID_SHEETS:
+            if name in dfs:
+                dfs[name].to_excel(writer, sheet_name=name, index=False)
+    return output.getvalue()
+
+def append_bitacora(accion: str, hoja: str, detalle: str = ""):
+    ts = datetime.now().isoformat(timespec="seconds")
+    row = {"timestamp": ts, "usuario": MASTER_USER, "accion": accion, "hoja": hoja, "detalle": detalle}
+    try:
+        if os.path.exists(BITACORA_PATH):
+            df = pd.read_csv(BITACORA_PATH)
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        else:
+            df = pd.DataFrame([row])
+        df.to_csv(BITACORA_PATH, index=False)
+    except Exception as e:
+        st.warning(f"No se pudo registrar en bitácora: {e}")
+
+# ====================== Acceso (sidebar) ======================
+with st.sidebar:
+    st.header("Acceso")
+    modo = st.radio("Modo", ["Usuario", "Máster"], horizontal=True)
+    if modo == "Máster":
+        user = st.text_input("Usuario", value=MASTER_USER)
+        pwd = st.text_input("Contraseña", type="password")
+        if st.button("Entrar", use_container_width=True):
+            st.session_state["is_master"] = (user == MASTER_USER and pwd == MASTER_PASS)
+            if st.session_state["is_master"]:
+                st.success("Acceso máster concedido.")
+            else:
+                st.error("Credenciales inválidas.")
+    else:
+        st.session_state["is_master"] = False
+
+    st.divider()
+    st.subheader("Bitácora")
+    if os.path.exists(BITACORA_PATH):
+        try:
+            bit = pd.read_csv(BITACORA_PATH)
+            st.write(f"Entradas: {len(bit)}")
+            st.download_button("Descargar (CSV)", bit.to_csv(index=False).encode("utf-8"),
+                               file_name="bitacora_cambios.csv", mime="text/csv", use_container_width=True)
+        except Exception as e:
+            st.info(f"No se pudo leer la bitácora: {e}")
+    else:
+        st.caption("Aún no hay bitácora.")
+
+is_master = bool(st.session_state.get("is_master", False))
+
+# ====================== Cargar libro ======================
+if not os.path.exists(EXCEL_PATH):
+    st.error(f"No existe el archivo: **{EXCEL_PATH}** en la raíz del repo. Súbelo y reinicia.")
+    st.stop()
+
+data = load_book(EXCEL_PATH)
+
+# ====================== Preparar TABLA ======================
+tabla_raw = data.get("Tabla")
+if tabla_raw is None or len(tabla_raw) < 3:
+    st.error("No se pudo leer la hoja **'Tabla'** (se requieren al menos 3 filas: títulos y datos).")
+    st.stop()
+
+# Cabeceras 'reales' suelen estar en la fila 0 y los datos a partir de la fila 2
+tabla_headers = tabla_raw.iloc[0].tolist()
+tabla_norm = tabla_raw.iloc[2:].copy()
+tabla_norm.columns = tabla_headers
+
+# Encontrar columnas CLAVE/DESCRIPCIÓN robustamente
+col_clave = match_col(tabla_norm.columns, "CLAVE")
+col_desc = match_col(tabla_norm.columns, "DESCRIPCION")  # cubre DESCRIPCIÓN
+if not col_clave:
+    st.error("No encuentro la columna **CLAVE** en la hoja 'Tabla'. "
+             "Verifica la fila de títulos (fila 0) y que exista la columna CLAVE.")
+    st.stop()
+
+# Columnas de DEPTO = todas las que tienen números y NO son clave/descripcion
+ignore = {"clave", "descripcion", "descripción", "modelo", "observaciones", "obs"}
+depto_options = []
+for c in tabla_norm.columns:
+    name = _normalize(c)
+    if name not in ignore and str(c) not in ("CLAVE", "DESCRIPCION"):
+        try:
+            vals = pd.to_numeric(tabla_norm[c], errors="coerce")
+            if vals.notna().sum() > 0:
+                depto_options.append(str(c))
+        except Exception:
+            pass
+depto_options = sorted(list(dict.fromkeys(depto_options)))
+
+# Claves disponibles
+claves = [c for c in tabla_norm[col_clave].dropna().astype(str).tolist() if str(c).strip()]
+
+# ====================== Preparar CALENDARIO ======================
+cal = data.get("Calendario")
+fecha_opts = []
+hora_i_col = hora_f_col = None
+if cal is not None and len(cal) > 0:
+    fcol = detect_fecha_column(cal)
+    if fcol:
+        fser = pd.to_datetime(cal[fcol], errors="coerce").dt.date.dropna()
+        fecha_opts = sorted(fser.unique().tolist())
+    hora_i_col = detect_time_column(cal)
+    hora_f_col = detect_time_end_column(cal)
+
+# ====================== Preparar tarifas $/hr desde TIEMPOS ======================
+rate_map = {}
 try:
-    if dias and hora_i_col and hora_f_col:
-        row = cal.loc[pd.to_datetime(cal[fcol], errors="coerce").dt.date == dia]
-        if not row.empty:
-            hi = row.iloc[0][hora_i_col]; hf = row.iloc[0][hora_f_col]
-            if pd.notna(hi): def_hora_i = pd.to_datetime(str(hi)).time()
-            if pd.notna(hf): def_hora_f = pd.to_datetime(str(hf)).time()
+    t_raw = data.get("Tiempos")
+    ti_heads = t_raw.iloc[0]
+    ti = t_raw.iloc[1:].copy()
+    ti.columns = ti_heads
+    tmp = ti[["DEPARTAMENTOS", "$/hr"]].dropna()
+    tmp["DEPARTAMENTOS"] = tmp["DEPARTAMENTOS"].astype(str).str.strip()
+    rate_map = tmp.groupby("DEPARTAMENTOS")["$/hr"].mean().to_dict()
 except Exception:
     pass
 
-hora_i = c5.time_input("Hora inicio", value=def_hora_i)
-hora_f = c6.time_input("Hora fin", value=def_hora_f)
+# ====================== Tabs UI ======================
+tabs = st.tabs(VALID_SHEETS)
 
-c7,c8,_ = st.columns(3)
-piezas = c7.number_input("Piezas producidas", min_value=1, value=1, step=1)
+# ---------------------- Tiempos (Captura) ----------------------
+with tabs[0]:
+    st.subheader("Captura rápida (igual a Excel)")
 
-# ---------- Lookup Min Std (Tabla) + Tarifa (Tiempos) ----------
-# depto puede venir en mayúsc/minúsc/espacios → empatar a columna real
-def match_col(cols, target):
-    t = ilike(target)
-    for c in cols:
-        if ilike(c) == t:
-            return c
-    return None
+    c1, c2, c3 = st.columns(3)
+    clave = c1.selectbox("CLAVE", options=claves, placeholder="Selecciona la clave")
+    depto = c2.selectbox("DEPTO", options=depto_options or ["COSTURA", "TAPIZ", "ARMADO", "CARPINTERIA"],
+                         placeholder="Selecciona el departamento")
+    empleado = c3.text_input("Empleado / Operador")
 
-dcol = match_col(tabla_norm.columns, depto)
-min_std = None
-modelo = None
-if dcol is not None and clave:
-    sel = tabla_norm.loc[tabla_norm["CLAVE"].astype(str)==str(clave), dcol].dropna()
-    if len(sel): min_std = float(sel.iloc[0])
-    # modelo/descripción si existe
+    c4, c5, c6 = st.columns(3)
+    # Día desde Calendario si está disponible
+    if fecha_opts:
+        dia = c4.selectbox("Día (desde Calendario)", options=fecha_opts, index=len(fecha_opts)-1)
+    else:
+        dia = c4.date_input("Día", value=date.today())
+
+    # Horas con defaults desde Calendario (si existen)
+    def_hi, def_hf = _time(8, 0), _time(17, 0)
     try:
-        dcol_desc = match_col(tabla_norm.columns, "descripcion")
-        if dcol_desc:
-            m = tabla_norm.loc[tabla_norm["CLAVE"].astype(str)==str(clave), dcol_desc].dropna()
-            if len(m): modelo = str(m.iloc[0])
+        if fecha_opts and hora_i_col and hora_f_col:
+            row = cal.loc[pd.to_datetime(cal[detect_fecha_column(cal)], errors="coerce").dt.date == dia]
+            if not row.empty:
+                hi = row.iloc[0][hora_i_col]; hf = row.iloc[0][hora_f_col]
+                if pd.notna(hi): def_hi = pd.to_datetime(str(hi)).time()
+                if pd.notna(hf): def_hf = pd.to_datetime(str(hf)).time()
     except Exception:
         pass
+    hora_i = c5.time_input("Hora inicio", value=def_hi)
+    hora_f = c6.time_input("Hora fin", value=def_hf)
 
-# Tarifa $/hr (case-insensitive)
-tarifa = rate_map.get(depto)
-if tarifa is None:
-    tarifa = {ilike(k):v for k,v in rate_map.items()}.get(ilike(depto))
+    c7, _, _ = st.columns(3)
+    produce = c7.number_input("Piezas producidas", min_value=1, value=1, step=1)
 
-st.caption(f"Min Std: **{min_std if min_std is not None else '—'}** | $/hr: **{tarifa if tarifa is not None else '—'}**")
+    # ---- Lookup Min Std en Tabla ----
+    std_min = None
+    modelo = None
+    dcol = match_col(tabla_norm.columns, depto)
+    if dcol is not None and clave:
+        sel = tabla_norm.loc[tabla_norm[col_clave].astype(str) == str(clave), dcol].dropna()
+        if len(sel):
+            std_min = float(sel.iloc[0])
+        # modelo/descripcion si existiera
+        if col_desc:
+            md = tabla_norm.loc[tabla_norm[col_clave].astype(str) == str(clave), col_desc].dropna()
+            if len(md):
+                modelo = str(md.iloc[0])
 
-# ---------- Calcular + Guardar ----------
-if st.button("Calcular y guardar en 'Tiempos'", use_container_width=True):
-    import datetime as _dt
-    t1 = _dt.datetime.combine(dia, hora_i)
-    t2 = _dt.datetime.combine(dia, hora_f)
-    total_secs = max(0, int((t2 - t1).total_seconds()))
-    total_min = total_secs/60
-    unit_min = total_min/piezas if piezas>0 else None
-    eficiencia = round(min_std/unit_min, 6) if (min_std and unit_min) else None
-    destajo_unit = round(tarifa/60*min_std, 6) if (tarifa is not None and min_std is not None) else None
-    destajo_total = round(destajo_unit*piezas, 6) if destajo_unit is not None else None
+    # ---- Tarifa $/hr desde Tiempos ----
+    tarifa = rate_map.get(depto)
+    if tarifa is None:
+        tarifa = {_normalize(k): v for k, v in rate_map.items()}.get(_normalize(depto))
 
-    if min_std is None or tarifa is None:
-        st.error("Falta Min Std o $/hr para esa CLAVE/DEPTO. Revisa 'Tabla' y 'Tiempos'.")
+    st.caption(
+        f"Columnas detectadas en 'Tabla': {', '.join(map(str, tabla_norm.columns))}"
+    )
+    st.caption(
+        f"Usando → CLAVE: **{col_clave}** | DESCRIPCIÓN: **{col_desc or '—'}** | "
+        f"Min Std: **{std_min if std_min is not None else '—'}** | $/hr: **{tarifa if tarifa is not None else '—'}**"
+    )
+
+    if st.button("Calcular y guardar en 'Tiempos'", use_container_width=True):
+        import datetime as _dt
+        t1 = _dt.datetime.combine(dia, hora_i)
+        t2 = _dt.datetime.combine(dia, hora_f)
+        total_secs = max(0, int((t2 - t1).total_seconds()))
+        total_min = total_secs / 60
+        unit_min = total_min / produce if produce > 0 else None
+        eficiencia = round(std_min / unit_min, 6) if (std_min and unit_min) else None
+        destajo_unit = round(tarifa / 60 * std_min, 6) if (tarifa is not None and std_min is not None) else None
+        destajo_total = round(destajo_unit * produce, 6) if destajo_unit is not None else None
+
+        if std_min is None or tarifa is None:
+            st.error("No se encontró **Min Std** o **$/hr** para esa CLAVE/DEPTO. "
+                     "Revisa 'Tabla' y 'Tiempos'.")
+        else:
+            # Respetar columnas existentes de Tiempos
+            traw = data["Tiempos"]
+            heads = traw.iloc[0].tolist()
+            new_row = {h: None for h in heads}
+
+            def setif(k, v):
+                if k in new_row:
+                    new_row[k] = v
+
+            setif("CLAVE", clave)
+            setif("DEPTO", depto)
+            setif("EMPLEADO", empleado)
+            setif("MODELO", modelo)
+            setif("Produce", produce)
+            setif("Día I", dia)
+            setif("Hora I", hora_i)
+            setif("Dia F", dia)
+            setif("Hora F", hora_f)
+            setif("Minutos\nStd\n", std_min)
+            setif("Tiempo\nUnitario\nMinutos", round(unit_min, 6) if unit_min is not None else None)
+            setif("Eficiencia", eficiencia)
+            setif("Destajo\nUnitario\n", destajo_unit)
+            setif("Total Hr", f"{int(total_min // 60):02d}:{int(total_min % 60):02d}:00")
+            setif("Min", int(total_min))
+            setif("Seg", total_secs % 60)
+            setif("Tot Seg", total_secs)
+
+            nuevo = pd.DataFrame([new_row])
+            data["Tiempos"] = pd.concat([traw, nuevo], ignore_index=True)
+
+            # Guardar libro (3 hojas)
+            with open(EXCEL_PATH, "wb") as f:
+                f.write(to_excel_bytes(data))
+
+            append_bitacora("captura_rapida", "Tiempos",
+                            f"clave={clave}, depto={depto}, pzas={produce}, unit={destajo_unit}, total={destajo_total}")
+            st.success(f"✅ Guardado | Destajo unit: {destajo_unit} | Destajo total: {destajo_total}")
+
+    st.markdown("**Vista de la hoja 'Tiempos' (actual):**")
+    st.dataframe(data["Tiempos"], use_container_width=True, height=320)
+
+# ---------------------- Tabla ----------------------
+with tabs[1]:
+    st.subheader("Tabla")
+    st.dataframe(tabla_norm, use_container_width=True, height=450)
+    st.caption("Las columnas de departamento (ej. COSTURA, TAPIZ, ARMADO…) se usan para el cálculo de Min Std.")
+
+# ---------------------- Calendario ----------------------
+with tabs[2]:
+    st.subheader("Calendario")
+    if cal is not None:
+        st.dataframe(cal, use_container_width=True, height=450)
+        st.caption("El selector de día (y horas si existen) se alimenta desde aquí.")
     else:
-        traw = data["Tiempos"]
-        heads = traw.iloc[0].tolist()
-        new_row = {h: None for h in heads}
-        def setif(k,v): 
-            if k in new_row: new_row[k]=v
-        setif("CLAVE", clave)
-        setif("DEPTO", depto)
-        setif("EMPLEADO", empleado)
-        setif("MODELO", modelo)
-        setif("Produce", piezas)
-        setif("Día I", dia)
-        setif("Hora I", hora_i)
-        setif("Dia F", dia)
-        setif("Hora F", hora_f)
-        setif("Minutos\nStd\n", min_std)
-        setif("Tiempo\nUnitario\nMinutos", round(unit_min,6) if unit_min is not None else None)
-        setif("Eficiencia", eficiencia)
-        setif("Destajo\nUnitario\n", destajo_unit)
-        setif("Total Hr", f"{int(total_min//60):02d}:{int(total_min%60):02d}:00")
-        setif("Min", int(total_min)); setif("Seg", total_secs%60); setif("Tot Seg", total_secs)
+        st.info("No se encontró la hoja 'Calendario'.")
 
-        nuevo = pd.DataFrame([new_row])
-        data["Tiempos"] = pd.concat([traw, nuevo], ignore_index=True)
-
-        # Guardar libro completo
-        from io import BytesIO
-        buf = BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            for s in data:
-                data[s].to_excel(w, sheet_name=s, index=False)
-        with open(EXCEL_PATH, "wb") as f:
-            f.write(buf.getvalue())
-
-        st.success(f"OK: Destajo unit {destajo_unit} | Total {destajo_total}")
+# ---------------------- Exportaciones rápidas ----------------------
+st.markdown("---")
+c1, c2 = st.columns(2)
+with c1:
+    st.download_button("Descargar Excel (3 hojas)",
+                       to_excel_bytes(data),
+                       file_name="TIEMPOS_DESTAJO_CORE_actualizado.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       use_container_width=True)
+with c2:
+    if os.path.exists(BITACORA_PATH):
+        bit = pd.read_csv(BITACORA_PATH)
+        st.download_button("Descargar Bitácora (CSV)",
+                           bit.to_csv(index=False).encode("utf-8"),
+                           file_name="bitacora_cambios.csv",
+                           mime="text/csv",
+                           use_container_width=True)
