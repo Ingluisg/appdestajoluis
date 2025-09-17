@@ -53,7 +53,7 @@ else:
     master = False
 
 st.title("App de Destajo — Núcleo")
-st.caption("Optimizada para móviles. Solo Tiempos, Tabla y Calendario.")
+st.caption("Optimizada para móviles.")
 
 tabs = st.tabs(["Tiempos", "Tabla", "Calendario"])
 
