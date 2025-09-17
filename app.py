@@ -80,10 +80,20 @@ ROLE_PERMS = {
 
 # ------------------ Auditoría ------------------
 def log_audit(user: str, action: str, record_id: Optional[int], details: Dict[str, Any]):
+    # Serializar cualquier datetime/pd.Timestamp a string (ISO)
+    payload = json.dumps(details, ensure_ascii=False, default=lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o))
+
     aud = load_parquet(AUDIT_FILE)
-    row = {"ts": now_iso(), "user": user, "action": action, "record_id": record_id, "details": json.dumps(details, ensure_ascii=False)}
+    row = {
+        "ts": now_iso(),
+        "user": user,
+        "action": action,
+        "record_id": int(record_id) if record_id is not None else None,
+        "details": payload,  # guardamos como JSON string
+    }
     aud = pd.concat([aud, pd.DataFrame([row])], ignore_index=True)
     save_parquet(aud, AUDIT_FILE)
+
 
 # ------------------ Login ------------------
 def login_box():
