@@ -1,4 +1,4 @@
-# app.py — Destajo con Roles, Auditoría y API (Streamlit Cloud-friendly)
+# app.py — Destajo con Roles, Auditoría y API (Cloud-friendly)
 import os, json, base64
 from datetime import datetime, date, time, timedelta
 from typing import Optional, Dict, Any
@@ -62,7 +62,6 @@ def load_users():
             return df
         except Exception:
             pass
-    # fallback: demo users
     return pd.DataFrame([
         {"user":"admin","role":"Admin","pin":"1234"},
         {"user":"supervisor","role":"Supervisor","pin":"1111"},
@@ -71,7 +70,7 @@ def load_users():
         {"user":"productividad","role":"Productividad","pin":"4444"},
     ])
 
-# Excel helpers (cálculo exacto)
+# ------------------ Excel helpers ------------------
 def detect_target_sheet(xl: pd.ExcelFile) -> str:
     for name in xl.sheet_names:
         key = "".join(str(name).split()).lower()
@@ -189,31 +188,15 @@ def compute_destajo_exact(df: pd.DataFrame, dept_df: pd.DataFrame):
 
 # ------------------ Permisos por rol ------------------
 ROLE_PERMS = {
-    "Admin": {
-        "editable": True,
-        "columns_view": "all",
-        "can_delete": True,
-    },
+    "Admin": {"editable": True, "columns_view": "all", "can_delete": True},
     "Supervisor": {
         "editable": True,
         "columns_view": ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Minutos_Std","Semana","Fuente","Usuario"],
         "can_delete": False,
     },
-    "Productividad": {
-        "editable": False,
-        "columns_view": "all",
-        "can_delete": False,
-    },
-    "Nominas": {
-        "editable": False,
-        "columns_view": ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Minutos_Proceso","Minutos_Std","Semana"],
-        "can_delete": False,
-    },
-    "RRHH": {
-        "editable": False,
-        "columns_view": ["DEPTO","EMPLEADO","MODELO","Produce","Semana"],
-        "can_delete": False,
-    },
+    "Productividad": {"editable": False, "columns_view": "all", "can_delete": False},
+    "Nominas": {"editable": False, "columns_view": ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Minutos_Proceso","Minutos_Std","Semana"], "can_delete": False},
+    "RRHH": {"editable": False, "columns_view": ["DEPTO","EMPLEADO","MODELO","Produce","Semana"], "can_delete": False},
 }
 
 CORE_COLUMNS = ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Minutos_Std","Semana","Fuente","Usuario"]
@@ -221,13 +204,7 @@ CORE_COLUMNS = ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Inicio","Fin","
 # ------------------ Auditoría ------------------
 def log_audit(user: str, action: str, record_id: Optional[int], details: Dict[str, Any]):
     aud = load_parquet(AUDIT_FILE)
-    row = {
-        "ts": now_iso(),
-        "user": user,
-        "action": action,
-        "record_id": record_id,
-        "details": json.dumps(details, ensure_ascii=False),
-    }
+    row = {"ts": now_iso(), "user": user, "action": action, "record_id": record_id, "details": json.dumps(details, ensure_ascii=False)}
     aud = pd.concat([aud, pd.DataFrame([row])], ignore_index=True)
     save_parquet(aud, AUDIT_FILE)
 
@@ -251,133 +228,104 @@ if "user" not in st.session_state:
     st.session_state.user = None
     st.session_state.role = None
 
-# ------------------ Modo API vía query params ------------------
-# Reemplazo: usar st.query_params en vez de st.experimental_get_query_params
-# ?api=ingest&token=XYZ&data=<base64json>
+# ------------------ Modo API (query params) ------------------
 qp = st.query_params
 if qp.get("api", [None])[0] == "ingest":
     token = qp.get("token", [None])[0]
     allowed = token and (token == (st.secrets.get("API_TOKEN") if hasattr(st, "secrets") else os.getenv("API_TOKEN","devtoken")))
     if not allowed:
-        st.write({"ok": False, "error": "TOKEN_INVALIDO"})
-        st.stop()
+        st.write({"ok": False, "error": "TOKEN_INVALIDO"}); st.stop()
     b64 = qp.get("data", [None])[0]
     if not b64:
-        st.write({"ok": False, "error": "FALTA_DATA"})
-        st.stop()
+        st.write({"ok": False, "error": "FALTA_DATA"}); st.stop()
     try:
         payload = json.loads(base64.urlsafe_b64decode(b64 + "==="))
     except Exception as e:
-        st.write({"ok": False, "error": f"JSON_INVALIDO: {e}"})
-        st.stop()
+        st.write({"ok": False, "error": f"JSON_INVALIDO: {e}"}); st.stop()
     required = ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Std"]
     missing = [k for k in required if k not in payload]
     if missing:
-        st.write({"ok": False, "error": f"FALTAN_CAMPOS: {missing}"})
-        st.stop()
+        st.write({"ok": False, "error": f"FALTAN_CAMPOS: {missing}"}); st.stop()
     db = load_parquet(DB_FILE)
     inicio = pd.to_datetime(payload["Inicio"], errors="coerce")
     fin = pd.to_datetime(payload["Fin"], errors="coerce")
     minutos_proceso = (fin - inicio).total_seconds()/60.0 if pd.notna(inicio) and pd.notna(fin) else np.nan
     row = {
-        "DEPTO": payload["DEPTO"],
-        "COLUMNA": payload["COLUMNA"],
-        "EMPLEADO": payload["EMPLEADO"],
-        "MODELO": payload["MODELO"],
-        "Produce": payload["Produce"],
-        "Inicio": inicio,
-        "Fin": fin,
-        "Minutos_Proceso": minutos_proceso,
-        "Minutos_Std": payload["Minutos_Std"],
-        "Semana": week_number(inicio),
-        "Fuente": "API",
-        "Usuario": "api-client",
+        "DEPTO": payload["DEPTO"], "COLUMNA": payload["COLUMNA"], "EMPLEADO": payload["EMPLEADO"], "MODELO": payload["MODELO"],
+        "Produce": payload["Produce"], "Inicio": inicio, "Fin": fin,
+        "Minutos_Proceso": minutos_proceso, "Minutos_Std": payload["Minutos_Std"],
+        "Semana": week_number(inicio), "Fuente": "API", "Usuario": "api-client",
     }
     db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
-    save_parquet(db, DB_FILE)
-    log_audit("api-client", "create", int(len(db)-1), {"via":"api", "row": row})
-    st.write({"ok": True, "inserted_id": int(len(db)-1)})
-    st.stop()
+    save_parquet(db, DB_FILE); log_audit("api-client", "create", int(len(db)-1), {"via":"api", "row": row})
+    st.write({"ok": True, "inserted_id": int(len(db)-1)}); st.stop()
 
 # ------------------ Flujo normal (UI) ------------------
 if not st.session_state.user:
-    login_box()
-    st.stop()
+    login_box(); st.stop()
+
+# Define permisos UNA VEZ y reúsalos
+perms = ROLE_PERMS.get(st.session_state.role, ROLE_PERMS["Supervisor"])
 
 st.sidebar.success(f"Sesión: {st.session_state.user} ({st.session_state.role})")
 if st.sidebar.button("Cerrar sesión"):
-    for k in ["user","role"]:
-        st.session_state.pop(k, None)
+    for k in ["user","role"]: st.session_state.pop(k, None)
     st.rerun()
 
 tabs = st.tabs(["📲 Captura", "📈 Tablero", "✏️ Editar / Auditar", "📚 Excel (exacto)", "🛠️ Admin"])
 
 # -------- Captura --------
 with tabs[0]:
-    if st.session_state.role not in ["Supervisor","Productividad","Admin"]:
+    st.subheader("Captura móvil")
+    if not perms["editable"]:
         st.info("Tu rol no tiene permisos para capturar.")
     else:
-        st.subheader("Captura móvil")
-
         # Listas desplegables desde historial
         db_prev = load_parquet(DB_FILE)
         empleados_hist = sorted([x for x in db_prev["EMPLEADO"].dropna().astype(str).unique().tolist()]) if not db_prev.empty and "EMPLEADO" in db_prev.columns else []
         modelos_hist = sorted([x for x in db_prev["MODELO"].dropna().astype(str).unique().tolist()]) if not db_prev.empty and "MODELO" in db_prev.columns else []
-if perms["editable"]:
-            with st.form("edit_form"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    empleado = st.text_input("Empleado", value=str(row.get("EMPLEADO","")))
-                    depto = st.text_input("DEPTO", value=str(row.get("DEPTO","")))
-                    columna = st.number_input("COLUMNA", value=int(row.get("COLUMNA") or 1), min_value=1, step=1)
-                    modelo = st.text_input("MODELO", value=str(row.get("MODELO","")))
-                    produce = st.number_input("Produce", value=int(row.get("Produce") or 0), min_value=0, step=1)
-                with c2:
-                    # --- Compat: usar date_input + time_input en vez de datetime_input ---
-                    ini_raw = pd.to_datetime(row.get("Inicio"), errors="coerce")
-                    fin_raw = pd.to_datetime(row.get("Fin"), errors="coerce")
 
-                    ini_date = st.date_input("Inicio (fecha)", value=(ini_raw.date() if pd.notna(ini_raw) else date.today()))
-                    ini_time = st.time_input("Inicio (hora)", value=(ini_raw.time() if pd.notna(ini_raw) else datetime.now().time().replace(second=0, microsecond=0)))
+        with st.form("form_captura", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                emp_choice = st.selectbox("Empleado*", options=(["— Selecciona —"] + empleados_hist + ["Otro…"]))
+                empleado_manual = st.text_input("Empleado (nuevo)*", placeholder="Nombre o ID") if emp_choice=="Otro…" else ""
+                depto = st.selectbox("Departamento*", options=["TAPIZ","COSTURA","CARPINTERIA","COJINERIA","CORTE","ARMADO","HILADO","COLCHONETA","OTRO"])
+                col_depto = st.number_input("Columna (depto)*", min_value=1, step=1, value=1)
+            with c2:
+                modelo_choice = st.selectbox("Modelo*", options=(["— Selecciona —"] + modelos_hist + ["Otro…"]))
+                modelo_manual = st.text_input("Modelo (nuevo)*", placeholder="Ej. MARIE 2 GAIA") if modelo_choice=="Otro…" else ""
+                produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1)
+                minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0)
 
-                    fin_date = st.date_input("Fin (fecha)", value=(fin_raw.date() if pd.notna(fin_raw) else date.today()))
-                    fin_time = st.time_input("Fin (hora)", value=(fin_raw.time() if pd.notna(fin_raw) else (datetime.now().time().replace(second=0, microsecond=0))))
+            if st.form_submit_button("➕ Agregar registro", use_container_width=True):
+                empleado = empleado_manual if emp_choice=="Otro…" else (emp_choice if emp_choice!="— Selecciona —" else "")
+                modelo = modelo_manual if modelo_choice=="Otro…" else (modelo_choice if modelo_choice!="— Selecciona —" else "")
+                if not empleado or not modelo:
+                    st.error("Empleado y Modelo son obligatorios.")
+                else:
+                    inicio = datetime.now()
+                    fin = inicio
+                    minutos_proceso = float(minutos_std) * float(produce)  # estimado rápido
 
-                    # recombinar
-                    inicio = datetime.combine(ini_date, ini_time)
-                    fin = datetime.combine(fin_date, fin_time)
-
-                    min_std = st.number_input("Minutos_Std", value=float(row.get("Minutos_Std") or 0.0), min_value=0.0, step=0.5)
-
-                submitted = st.form_submit_button("💾 Guardar cambios")
-                if submitted:
-                    before = db.iloc[int(idx)].to_dict()
-                    db.at[int(idx), "EMPLEADO"] = empleado
-                    db.at[int(idx), "DEPTO"] = depto
-                    db.at[int(idx), "COLUMNA"] = columna
-                    db.at[int(idx), "MODELO"] = modelo
-                    db.at[int(idx), "Produce"] = produce
-                    db.at[int(idx), "Inicio"] = inicio
-                    db.at[int(idx), "Fin"] = fin
-                    db.at[int(idx), "Minutos_Proceso"] = (pd.to_datetime(fin) - pd.to_datetime(inicio)).total_seconds()/60.0
-                    db.at[int(idx), "Minutos_Std"] = min_std
-                    db.at[int(idx), "Semana"] = week_number(inicio)
+                    row = {
+                        "DEPTO": depto, "COLUMNA": col_depto, "EMPLEADO": empleado, "MODELO": modelo,
+                        "Produce": produce, "Inicio": inicio, "Fin": fin,
+                        "Minutos_Proceso": minutos_proceso, "Minutos_Std": minutos_std,
+                        "Semana": week_number(inicio), "Fuente": "CAPTURA_APP_AUTO", "Usuario": st.session_state.user,
+                        "Estimado": True,
+                    }
+                    db = load_parquet(DB_FILE)
+                    db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
                     save_parquet(db, DB_FILE)
-                    after = db.iloc[int(idx)].to_dict()
-                    log_audit(st.session_state.user, "update", int(idx), {"before": before, "after": after})
-                    st.success("Actualizado ✅")
-        
+                    log_audit(st.session_state.user, "create", int(len(db)-1), {"via":"ui_auto", "row": row})
+                    st.success("Registro guardado ✅ (Fecha/Hora automáticos)")
 
 # -------- Tablero --------
 with tabs[1]:
     st.subheader("Producción en vivo")
     base = load_parquet(DB_FILE)
-
-    perms = ROLE_PERMS.get(st.session_state.role, ROLE_PERMS["Supervisor"])
-    if perms["columns_view"] == "all":
-        view_cols = base.columns.tolist()
-    else:
-        view_cols = [c for c in perms["columns_view"] if c in base.columns]
+    view_cols = base.columns.tolist() if perms["columns_view"]=="all" else [c for c in perms["columns_view"] if c in base.columns]
 
     c1, c2, c3 = st.columns(3)
     f_depto = c1.multiselect("Departamento", sorted(base["DEPTO"].dropna().astype(str).unique().tolist()) if not base.empty else [])
@@ -401,9 +349,7 @@ with tabs[1]:
 
 # -------- Editar / Auditar --------
 with tabs[2]:
-    perms = ROLE_PERMS.get(st.session_state.role, ROLE_PERMS["Supervisor"])
     st.subheader("Edición controlada y bitácora")
-
     db = load_parquet(DB_FILE)
     if db.empty:
         st.info("No hay datos para editar.")
@@ -422,9 +368,16 @@ with tabs[2]:
                     modelo = st.text_input("MODELO", value=str(row.get("MODELO","")))
                     produce = st.number_input("Produce", value=int(row.get("Produce") or 0), min_value=0, step=1)
                 with c2:
-                    inicio = st.datetime_input("Inicio", value=pd.to_datetime(row.get("Inicio")) if pd.notna(row.get("Inicio")) else datetime.now())
-                    fin = st.datetime_input("Fin", value=pd.to_datetime(row.get("Fin")) if pd.notna(row.get("Fin")) else datetime.now())
+                    ini_raw = pd.to_datetime(row.get("Inicio"), errors="coerce")
+                    fin_raw = pd.to_datetime(row.get("Fin"), errors="coerce")
+                    ini_date = st.date_input("Inicio (fecha)", value=(ini_raw.date() if pd.notna(ini_raw) else date.today()))
+                    ini_time = st.time_input("Inicio (hora)", value=(ini_raw.time() if pd.notna(ini_raw) else datetime.now().time().replace(second=0, microsecond=0)))
+                    fin_date = st.date_input("Fin (fecha)", value=(fin_raw.date() if pd.notna(fin_raw) else date.today()))
+                    fin_time = st.time_input("Fin (hora)", value=(fin_raw.time() if pd.notna(fin_raw) else datetime.now().time().replace(second=0, microsecond=0)))
+                    inicio = datetime.combine(ini_date, ini_time)
+                    fin = datetime.combine(fin_date, fin_time)
                     min_std = st.number_input("Minutos_Std", value=float(row.get("Minutos_Std") or 0.0), min_value=0.0, step=0.5)
+
                 submitted = st.form_submit_button("💾 Guardar cambios")
                 if submitted:
                     before = db.iloc[int(idx)].to_dict()
@@ -465,8 +418,7 @@ with tabs[3]:
     up = st.file_uploader("Sube tu Excel original (.xlsx) con hoja **Tiempos**", type=["xlsx"])
     if up is not None:
         struct = read_excel_struct(up)
-        data = struct["data"]
-        dept_df = struct["dept_df"]
+        data = struct["data"]; dept_df = struct["dept_df"]
         result = compute_destajo_exact(data, dept_df)
 
         core_cols = ['DEPTO','COLUMNA','EMPLEADO','MODELO','Produce','Minutos_Proceso','Minutos_Std','Eficiencia_calc','Tarifa_hr','Tarifa_min','Destajo_Unitario_calc','Pago_total']
@@ -489,32 +441,15 @@ with tabs[4]:
         st.info("Solo Admin puede administrar.")
     else:
         st.subheader("Administración")
-        st.markdown("**Usuarios (users.csv)** — columnas: `user, role, pin`. Roles válidos: Admin, Supervisor, Nominas, RRHH, Productividad.")
         st.code("user,role,pin\nadmin,Admin,1234\nsupervisor,Supervisor,1111\nnominas,Nominas,2222\nrrhh,RRHH,3333\nproductividad,Productividad,4444", language="text")
-
         st.markdown("**API** (token via `st.secrets['API_TOKEN']` o var de entorno `API_TOKEN`):")
         st.code("""# GET
 # ?api=ingest&token=TU_TOKEN&data=<base64url(JSON)>
 # JSON ejemplo:
-{
-  "DEPTO":"TAPIZ","COLUMNA":10,"EMPLEADO":"L1-36","MODELO":"SALLY 3-2",
-  "Produce":12,
-  "Inicio":"2025-09-17T08:00:00",
-  "Fin":"2025-09-17T09:00:00",
-  "Minutos_Std":20
-}""", language="json")
-        st.markdown("**cURL ejemplo (Linux/Mac):**")
-        st.code("""DATA='{"DEPTO":"TAPIZ","COLUMNA":10,"EMPLEADO":"L1-36","MODELO":"SALLY 3-2","Produce":12,"Inicio":"2025-09-17T08:00:00","Fin":"2025-09-17T09:00:00","Minutos_Std":20}'
-B64=$(python - <<'EOF'
-import base64,sys; print(base64.urlsafe_b64encode(sys.argv[1].encode()).decode().rstrip('='))
-EOF "$DATA")
-echo "https://<tu-app-streamlit>/?api=ingest&token=<TU_TOKEN>&data=$B64"
-""", language="bash")
+{"DEPTO":"TAPIZ","COLUMNA":10,"EMPLEADO":"L1-36","MODELO":"SALLY 3-2","Produce":12,"Inicio":"2025-09-17T08:00:00","Fin":"2025-09-17T09:00:00","Minutos_Std":20}""", language="json")
 
         st.markdown("---")
-        st.markdown("**Base de datos**")
-        db = load_parquet(DB_FILE)
-        st.write(f"Registros: {len(db)}")
+        db = load_parquet(DB_FILE); st.write(f"Registros: {len(db)}")
         if not db.empty:
             st.dataframe(db.tail(50), use_container_width=True, hide_index=True)
             colA, colB = st.columns(2)
@@ -522,7 +457,6 @@ echo "https://<tu-app-streamlit>/?api=ingest&token=<TU_TOKEN>&data=$B64"
                 pass
             if colB.button("🗑️ Borrar todo (irrevocable)"):
                 os.remove(DB_FILE) if os.path.exists(DB_FILE) else None
-                st.success("Base de datos borrada")
-                st.rerun()
+                st.success("Base de datos borrada"); st.rerun()
 
-st.caption("© 2025 · Destajo móvil con roles, auditoría y API por query params. Para producción real, considera FastAPI detrás de un reverse proxy.")
+st.caption("© 2025 · Destajo móvil con roles, auditoría y API.")
