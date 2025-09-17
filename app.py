@@ -22,6 +22,44 @@ MASTER_USER = "master"
 MASTER_PASS = st.secrets.get("MASTER_PASS","master1234")
 
 # =============== Utils comunes ===============
+def _safe_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Convierte columnas problemáticas a texto para que st.dataframe no truene con Arrow."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    # 1) Encabezados siempre string y únicos
+    out.columns = [str(c) for c in out.columns]
+    # evita columnas duplicadas
+    if len(set(out.columns)) != len(out.columns):
+        out.columns = [f"{c}__{i}" for i, c in enumerate(out.columns)]
+
+    # 2) Columnas con tipos problemáticos -> string
+    def needs_str(col: pd.Series) -> bool:
+        if pd.api.types.is_datetime64_any_dtype(col):  # fechas
+            return True
+        # mezcla de tipos, objetos, dicts/listas/sets o times
+        sample = col.dropna().head(20).tolist()
+        for x in sample:
+            if isinstance(x, (list, dict, set)):
+                return True
+            # time puro
+            import datetime as _dt
+            if isinstance(x, (_dt.time,)):
+                return True
+        # si Arrow no puede inferir numérico/booleano, lo mandamos a str
+        try:
+            pd.to_numeric(col.dropna(), errors="raise")
+            return False
+        except Exception:
+            # si casi todo es texto, devuélvelo como texto
+            return col.dtype == object
+
+    for c in out.columns:
+        if needs_str(out[c]):
+            out[c] = out[c].astype(str)
+
+    return out
 def _norm(s: str) -> str:
     s = str(s).strip().lower()
     s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
