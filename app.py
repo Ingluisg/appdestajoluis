@@ -323,55 +323,50 @@ with tabs[0]:
         db_prev = load_parquet(DB_FILE)
         empleados_hist = sorted([x for x in db_prev["EMPLEADO"].dropna().astype(str).unique().tolist()]) if not db_prev.empty and "EMPLEADO" in db_prev.columns else []
         modelos_hist = sorted([x for x in db_prev["MODELO"].dropna().astype(str).unique().tolist()]) if not db_prev.empty and "MODELO" in db_prev.columns else []
+if perms["editable"]:
+            with st.form("edit_form"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    empleado = st.text_input("Empleado", value=str(row.get("EMPLEADO","")))
+                    depto = st.text_input("DEPTO", value=str(row.get("DEPTO","")))
+                    columna = st.number_input("COLUMNA", value=int(row.get("COLUMNA") or 1), min_value=1, step=1)
+                    modelo = st.text_input("MODELO", value=str(row.get("MODELO","")))
+                    produce = st.number_input("Produce", value=int(row.get("Produce") or 0), min_value=0, step=1)
+                with c2:
+                    # --- Compat: usar date_input + time_input en vez de datetime_input ---
+                    ini_raw = pd.to_datetime(row.get("Inicio"), errors="coerce")
+                    fin_raw = pd.to_datetime(row.get("Fin"), errors="coerce")
 
-        with st.form("form_captura", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                emp_choice = st.selectbox("Empleado*", options=(["— Selecciona —"] + empleados_hist + ["Otro…"]))
-                empleado_manual = ""
-                if emp_choice == "Otro…":
-                    empleado_manual = st.text_input("Empleado (nuevo)*", placeholder="Nombre o ID")
-                depto = st.selectbox("Departamento*", options=["TAPIZ","COSTURA","CARPINTERIA","COJINERIA","CORTE","ARMADO","HILADO","COLCHONETA","OTRO"])
-                col_depto = st.number_input("Columna (depto)*", min_value=1, step=1)
-            with c2:
-                modelo_choice = st.selectbox("Modelo*", options=(["— Selecciona —"] + modelos_hist + ["Otro…"]))
-                modelo_manual = ""
-                if modelo_choice == "Otro…":
-                    modelo_manual = st.text_input("Modelo (nuevo)*", placeholder="Ej. MARIE 2 GAIA")
-                produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1)
-                minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5)
+                    ini_date = st.date_input("Inicio (fecha)", value=(ini_raw.date() if pd.notna(ini_raw) else date.today()))
+                    ini_time = st.time_input("Inicio (hora)", value=(ini_raw.time() if pd.notna(ini_raw) else datetime.now().time().replace(second=0, microsecond=0)))
 
-            if st.form_submit_button("➕ Agregar registro", use_container_width=True):
-                empleado = empleado_manual if emp_choice == "Otro…" else (emp_choice if emp_choice != "— Selecciona —" else "")
-                modelo = modelo_manual if modelo_choice == "Otro…" else (modelo_choice if modelo_choice != "— Selecciona —" else "")
+                    fin_date = st.date_input("Fin (fecha)", value=(fin_raw.date() if pd.notna(fin_raw) else date.today()))
+                    fin_time = st.time_input("Fin (hora)", value=(fin_raw.time() if pd.notna(fin_raw) else (datetime.now().time().replace(second=0, microsecond=0))))
 
-                if not empleado or not modelo:
-                    st.error("Empleado y Modelo son obligatorios.")
-                else:
-                    inicio = datetime.now()
-                    fin = inicio  # mismo sello
-                    minutos_proceso = float(minutos_std) * float(produce)  # estimado rápido
+                    # recombinar
+                    inicio = datetime.combine(ini_date, ini_time)
+                    fin = datetime.combine(fin_date, fin_time)
 
-                    row = {
-                        "DEPTO": depto,
-                        "COLUMNA": col_depto,
-                        "EMPLEADO": empleado,
-                        "MODELO": modelo,
-                        "Produce": produce,
-                        "Inicio": inicio,
-                        "Fin": fin,
-                        "Minutos_Proceso": minutos_proceso,  # estimado
-                        "Minutos_Std": minutos_std,
-                        "Semana": week_number(inicio),
-                        "Fuente": "CAPTURA_APP_AUTO",
-                        "Usuario": st.session_state.user,
-                        "Estimado": True,
-                    }
-                    db = load_parquet(DB_FILE)
-                    db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
+                    min_std = st.number_input("Minutos_Std", value=float(row.get("Minutos_Std") or 0.0), min_value=0.0, step=0.5)
+
+                submitted = st.form_submit_button("💾 Guardar cambios")
+                if submitted:
+                    before = db.iloc[int(idx)].to_dict()
+                    db.at[int(idx), "EMPLEADO"] = empleado
+                    db.at[int(idx), "DEPTO"] = depto
+                    db.at[int(idx), "COLUMNA"] = columna
+                    db.at[int(idx), "MODELO"] = modelo
+                    db.at[int(idx), "Produce"] = produce
+                    db.at[int(idx), "Inicio"] = inicio
+                    db.at[int(idx), "Fin"] = fin
+                    db.at[int(idx), "Minutos_Proceso"] = (pd.to_datetime(fin) - pd.to_datetime(inicio)).total_seconds()/60.0
+                    db.at[int(idx), "Minutos_Std"] = min_std
+                    db.at[int(idx), "Semana"] = week_number(inicio)
                     save_parquet(db, DB_FILE)
-                    log_audit(st.session_state.user, "create", int(len(db)-1), {"via":"ui_auto", "row": row})
-                    st.success("Registro guardado ✅ (Fecha/Hora automáticos)")
+                    after = db.iloc[int(idx)].to_dict()
+                    log_audit(st.session_state.user, "update", int(idx), {"before": before, "after": after})
+                    st.success("Actualizado ✅")
+        
 
 # -------- Tablero --------
 with tabs[1]:
