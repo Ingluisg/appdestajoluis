@@ -15,8 +15,28 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "registros.parquet")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.parquet")
 USERS_FILE = "users.csv"  # user,role,pin
+# --- Catálogos (empleados / modelos) ---
+CAT_EMP = os.path.join(DATA_DIR, "cat_empleados.csv")
+CAT_MOD = os.path.join(DATA_DIR, "cat_modelos.csv")
 
+def load_catalog(path: str, colname: str) -> list[str]:
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path, dtype=str)
+            if colname in df.columns:
+                items = [x.strip() for x in df[colname].dropna().astype(str).tolist() if str(x).strip()]
+                return sorted(list(dict.fromkeys(items)))
+        except Exception:
+            pass
+    return []
+
+def save_catalog(path: str, colname: str, items: list[str]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df = pd.DataFrame({colname: sorted(list(dict.fromkeys([x.strip() for x in items if str(x).strip()])) )})
+    df.to_csv(path, index=False)
 # ------------------ Utilidades ------------------
+
+
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
