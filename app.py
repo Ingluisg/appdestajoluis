@@ -432,10 +432,48 @@ with tabs[2]:
         st.caption("El selector de día (y horas si existen) se alimenta desde aquí.")
     else:
         st.info("Sin Excel (solo API).")
-
 # ----------- Descargas / KPI API -----------
 st.markdown("---")
 c1, c2, c3 = st.columns(3)
+
 with c1:
     if data:
-        st.download_button("Descargar Excel (3 hojas
+        st.download_button(
+            "Descargar Excel (3 hojas)",
+            to_excel_bytes(data),
+            file_name="TIEMPOS_DESTAJO_CORE_actualizado.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+with c2:
+    if os.path.exists(BITACORA_PATH):
+        bit = pd.read_csv(BITACORA_PATH)
+        st.download_button(
+            "Descargar Bitácora (CSV)",
+            bit.to_csv(index=False).encode("utf-8"),
+            file_name="bitacora_cambios.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+with c3:
+    st.subheader("KPI (API)")
+    df = st.date_input("Rango", value=(date.today(), date.today()))
+    dept_f = st.text_input("Depto (opcional)").strip().upper()
+    if st.button("Consultar KPI API", use_container_width=True):
+        if api_enabled():
+            res = api_summary(
+                df[0] if isinstance(df, tuple) else date.today(),
+                df[1] if isinstance(df, tuple) else date.today(),
+                dept_f or None,
+            )
+            if res:
+                st.success(
+                    f"Piezas: {res.get('pieces')} | Destajo total: {res.get('destajo_total')} | "
+                    f"Eficiencia prom.: {res.get('efficiency_avg')}"
+                )
+            else:
+                st.error("No pude obtener KPI de la API (revisa API_URL/credenciales).")
+        else:
+            st.info("Configura la API en Secrets para KPIs en vivo.")
