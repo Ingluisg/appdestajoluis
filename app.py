@@ -1,6 +1,6 @@
-# app.py — Destajo con Roles, Auditoría, API y Catálogos (Cloud-friendly)
+# app.py — Destajo con Roles, Auditoría, API y Catálogos (Cloud-friendly) + Cierre automático por empleado
 import os, json, base64
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date
 from typing import Optional, Dict, Any, List
 
 import numpy as np
@@ -67,7 +67,6 @@ def load_catalog(path: str, colname: str) -> List[str]:
             df = pd.read_csv(path, dtype=str)
             if colname in df.columns:
                 items = [x.strip() for x in df[colname].dropna().astype(str).tolist() if str(x).strip()]
-                # dedupe manteniendo orden
                 return sorted(list(dict.fromkeys(items)))
         except Exception:
             pass
@@ -310,22 +309,42 @@ with tabs[0]:
                         save_catalog(CAT_MOD, "modelo", modelos_cat + [modelo])
                         modelos_cat.append(modelo)
 
-                    inicio = datetime.now()
-                    fin = inicio
-                    minutos_proceso = float(minutos_std) * float(produce)  # estimado rápido
+                    # --- Cierre automático del trabajo previo del mismo empleado ---
+                    ahora = datetime.now()
+                    db = load_parquet(DB_FILE)
+                    if not db.empty and "EMPLEADO" in db.columns:
+                        # Consideramos "abierto" cuando Fin == Inicio (registro esperando cierre)
+                        try:
+                            db["Inicio"] = pd.to_datetime(db["Inicio"], errors="coerce")
+                            db["Fin"] = pd.to_datetime(db["Fin"], errors="coerce")
+                        except Exception:
+                            pass
+                        abiertos = db[(db["EMPLEADO"].astype(str)==str(empleado)) & (db["Inicio"].notna()) & (db["Fin"].notna()) & (db["Inicio"]==db["Fin"])]
+                        if not abiertos.empty:
+                            idx_last = abiertos.index[-1]
+                            ini_prev = pd.to_datetime(db.at[idx_last, "Inicio"])
+                            db.at[idx_last, "Fin"] = ahora
+                            db.at[idx_last, "Minutos_Proceso"] = (ahora - ini_prev).total_seconds()/60.0
+                            db.at[idx_last, "Estimado"] = False
+                            log_audit(st.session_state.user, "auto-close", int(idx_last), {"empleado": empleado, "cerrado": ahora.isoformat(timespec="seconds")})
+                            save_parquet(db, DB_FILE)  # guardamos el cierre antes de insertar el nuevo
 
+                    # --- Insertar nuevo trabajo "abierto" (Fin=Inicio, Minutos_Proceso=0) ---
+                    inicio = ahora
+                    fin = inicio
                     row = {
                         "DEPTO": depto, "COLUMNA": col_depto, "EMPLEADO": empleado, "MODELO": modelo,
                         "Produce": produce, "Inicio": inicio, "Fin": fin,
-                        "Minutos_Proceso": minutos_proceso, "Minutos_Std": minutos_std,
+                        "Minutos_Proceso": 0.0,  # se calculará al cerrar
+                        "Minutos_Std": minutos_std,
                         "Semana": week_number(inicio), "Fuente": "CAPTURA_APP_AUTO", "Usuario": st.session_state.user,
                         "Estimado": True,
                     }
-                    db = load_parquet(DB_FILE)
+                    db = load_parquet(DB_FILE)  # recarga por si acabamos de guardar el cierre
                     db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
                     save_parquet(db, DB_FILE)
                     log_audit(st.session_state.user, "create", int(len(db)-1), {"via":"ui_auto", "row": row})
-                    st.success("Registro guardado ✅ (Fecha/Hora automáticos)")
+                    st.success("Registro guardado ✅ (cierre automático del previo si existía)")
 
 # -------- Tablero --------
 with tabs[1]:
@@ -508,4 +527,4 @@ with tabs[4]:
                 os.remove(DB_FILE) if os.path.exists(DB_FILE) else None
                 st.success("Base de datos borrada"); st.rerun()
 
-st.caption("© 2025 · Destajo móvil con roles, auditoría, API y catálogos.")
+st.caption("© 2025 · Destajo móvil con roles, auditoría, API, catálogos y cierre automático por empleado.")
