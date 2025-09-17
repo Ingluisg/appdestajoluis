@@ -252,9 +252,9 @@ if "user" not in st.session_state:
     st.session_state.role = None
 
 # ------------------ Modo API vía query params ------------------
+# Reemplazo: usar st.query_params en vez de st.experimental_get_query_params
 # ?api=ingest&token=XYZ&data=<base64json>
-# JSON requerido: DEPTO, COLUMNA, EMPLEADO, MODELO, Produce, Inicio, Fin, Minutos_Std
-qp = st.experimental_get_query_params()
+qp = st.query_params
 if qp.get("api", [None])[0] == "ingest":
     token = qp.get("token", [None])[0]
     allowed = token and (token == (st.secrets.get("API_TOKEN") if hasattr(st, "secrets") else os.getenv("API_TOKEN","devtoken")))
