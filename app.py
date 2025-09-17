@@ -1,7 +1,7 @@
-# app.py — Destajo con Roles, Auditoría y API (Cloud-friendly)
+# app.py — Destajo con Roles, Auditoría, API y Catálogos (Cloud-friendly)
 import os, json, base64
 from datetime import datetime, date, time, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import numpy as np
 import pandas as pd
@@ -15,43 +15,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "registros.parquet")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.parquet")
 USERS_FILE = "users.csv"  # user,role,pin
-# --- Catálogos (empleados / modelos) ---
-CAT_EMP = os.path.join(DATA_DIR, "cat_empleados.csv")
-CAT_MOD = os.path.join(DATA_DIR, "cat_modelos.csv")
 
-def load_catalog(path: str, colname: str) -> list[str]:
-    if os.path.exists(path):
-        try:
-            df = pd.read_csv(path, dtype=str)
-            if colname in df.columns:
-                items = [x.strip() for x in df[colname].dropna().astype(str).tolist() if str(x).strip()]
-                return sorted(list(dict.fromkeys(items)))
-        except Exception:
-            pass
-    return []
-
-def save_catalog(path: str, colname: str, items: list[str]):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df = pd.DataFrame({colname: sorted(list(dict.fromkeys([x.strip() for x in items if str(x).strip()])) )})
-    df.to_csv(path, index=False)
 # ------------------ Utilidades ------------------
-
-
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
-
-def combine_date_time(d, t):
-    if pd.isna(d) or pd.isna(t):
-        return pd.NaT
-    try:
-        d2 = pd.to_datetime(d).date()
-        if isinstance(t, (pd.Timestamp, datetime)):
-            tt = t.time()
-        else:
-            tt = pd.to_datetime(str(t)).time()
-        return datetime.combine(d2, tt)
-    except Exception:
-        return pd.NaT
 
 def week_number(dt: Optional[datetime]):
     if pd.isna(dt) or dt is None:
@@ -90,7 +57,28 @@ def load_users():
         {"user":"productividad","role":"Productividad","pin":"4444"},
     ])
 
-# ------------------ Excel helpers ------------------
+# ------------------ Catálogos (empleados / modelos) ------------------
+CAT_EMP = os.path.join(DATA_DIR, "cat_empleados.csv")
+CAT_MOD = os.path.join(DATA_DIR, "cat_modelos.csv")
+
+def load_catalog(path: str, colname: str) -> List[str]:
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path, dtype=str)
+            if colname in df.columns:
+                items = [x.strip() for x in df[colname].dropna().astype(str).tolist() if str(x).strip()]
+                # dedupe manteniendo orden
+                return sorted(list(dict.fromkeys(items)))
+        except Exception:
+            pass
+    return []
+
+def save_catalog(path: str, colname: str, items: List[str]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    clean = sorted(list(dict.fromkeys([str(x).strip() for x in items if str(x).strip()])))
+    pd.DataFrame({colname: clean}).to_csv(path, index=False)
+
+# ------------------ Excel helpers (para cálculo exacto) ------------------
 def detect_target_sheet(xl: pd.ExcelFile) -> str:
     for name in xl.sheet_names:
         key = "".join(str(name).split()).lower()
@@ -124,16 +112,13 @@ def read_excel_struct(file) -> dict:
         'Tiempo\nUnitario\nMinutos':'TU_Minutos',
         'Minutos\nStd\n':'Minutos_Std',
         'Destajo\nUnitario\n':'Destajo_Unitario',
-        'Día I':'Dia_I',
-        'Dia I':'Dia_I',
-        'Día F':'Dia_F',
-        'Dia F':'Dia_F',
-        'Hora I':'Hora_I',
-        'Hora F':'Hora_F',
+        'Día I':'Dia_I', 'Dia I':'Dia_I',
+        'Día F':'Dia_F', 'Dia F':'Dia_F',
+        'Hora I':'Hora_I', 'Hora F':'Hora_F',
     }
     data.rename(columns=rename_map, inplace=True)
 
-    # tabla departamentos (intentamos últimas 4 columnas)
+    # Intentar localizar bloque de DEPARTAMENTOS a la derecha
     dept_df = None
     right_block = data.iloc[:, -4:].copy()
     rb_cols = [str(c).strip().upper() for c in right_block.columns]
@@ -152,28 +137,21 @@ def read_excel_struct(file) -> dict:
 
 def compute_destajo_exact(df: pd.DataFrame, dept_df: pd.DataFrame):
     out = df.copy()
-
-    # tarifas por hora desde dept_df
+    # mapa de tarifa $/hr por COLUMNA
     rate_per_hr_map = {}
     if dept_df is not None and not dept_df.empty:
         dd = dept_df.rename(columns=lambda c: str(c).strip())
         col_col = [c for c in dd.columns if str(c).strip().upper()=="COLUMNA"]
-        hr_col = [c for c in dd.columns if "$/HR" in str(c).upper()]
+        hr_col  = [c for c in dd.columns if "$/HR" in str(c).upper()]
         if col_col and hr_col:
             tmp = dd[[col_col[0], hr_col[0]]].dropna()
             tmp[col_col[0]] = pd.to_numeric(tmp[col_col[0]], errors='coerce')
-            tmp[hr_col[0]] = pd.to_numeric(tmp[hr_col[0]], errors='coerce')
+            tmp[hr_col[0]]  = pd.to_numeric(tmp[hr_col[0]], errors='coerce')
             rate_per_hr_map = {int(r[col_col[0]]): float(r[hr_col[0]]) for _, r in tmp.dropna().iterrows()}
 
+    # minutos proceso (si faltan pero hay columnas de fechas/horas)
     if 'Minutos_Proceso' not in out.columns or out['Minutos_Proceso'].isna().all():
-        if {'Dia_I','Hora_I','Dia_F','Hora_F'}.issubset(out.columns):
-            start = [combine_date_time(out.loc[i,'Dia_I'], out.loc[i,'Hora_I']) for i in out.index]
-            end   = [combine_date_time(out.loc[i,'Dia_F'], out.loc[i,'Hora_F']) for i in out.index]
-            out['Inicio'] = pd.to_datetime(start, errors='coerce')
-            out['Fin'] = pd.to_datetime(end, errors='coerce')
-            out['Minutos_Proceso'] = (out['Fin'] - out['Inicio']).dt.total_seconds() / 60.0
-        else:
-            out['Minutos_Proceso'] = np.nan
+        out['Minutos_Proceso'] = np.nan
 
     out['Produce'] = pd.to_numeric(out.get('Produce', np.nan), errors='coerce')
     out['Minutos_Proceso'] = pd.to_numeric(out['Minutos_Proceso'], errors='coerce')
@@ -184,15 +162,15 @@ def compute_destajo_exact(df: pd.DataFrame, dept_df: pd.DataFrame):
     else:
         out['Minutos_Std'] = pd.to_numeric(out.get('Minutos_Std', np.nan), errors='coerce')
 
-    # Eficiencia (cap en 1)
+    # Eficiencia (cap 1.0)
     out['Eficiencia_calc'] = np.where(out['Minutos_Proceso']>0,
                                       (out['Produce'] * out['Minutos_Std']) / out['Minutos_Proceso'],
                                       np.nan).clip(upper=1.0)
 
-    # Tarifa por minuto desde COLUMNA -> $/hr / 60
+    # Tarifa por minuto
     if 'COLUMNA' in out.columns and rate_per_hr_map:
         colnum = pd.to_numeric(out['COLUMNA'], errors='coerce').astype('Int64')
-        out['Tarifa_hr'] = colnum.map(rate_per_hr_map).astype(float)
+        out['Tarifa_hr']  = colnum.map(rate_per_hr_map).astype(float)
         out['Tarifa_min'] = out['Tarifa_hr'] / 60.0
     else:
         out['Tarifa_hr'] = np.nan
@@ -201,9 +179,6 @@ def compute_destajo_exact(df: pd.DataFrame, dept_df: pd.DataFrame):
     out['Destajo_Unitario_calc'] = out['Minutos_Std'] * out['Tarifa_min']
     out['Pago_total'] = out['Destajo_Unitario_calc'] * out['Produce'] * out['Eficiencia_calc']
 
-    if 'Inicio' in out.columns:
-        out['Semana'] = out['Inicio'].dt.isocalendar().week
-
     return out
 
 # ------------------ Permisos por rol ------------------
@@ -211,7 +186,7 @@ ROLE_PERMS = {
     "Admin": {"editable": True, "columns_view": "all", "can_delete": True},
     "Supervisor": {
         "editable": True,
-        "columns_view": ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Minutos_Std","Semana","Fuente","Usuario"],
+        "columns_view": ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Minutos_Std","Semana","Fuente","Usuario","Estimado"],
         "can_delete": False,
     },
     "Productividad": {"editable": False, "columns_view": "all", "can_delete": False},
@@ -219,7 +194,7 @@ ROLE_PERMS = {
     "RRHH": {"editable": False, "columns_view": ["DEPTO","EMPLEADO","MODELO","Produce","Semana"], "can_delete": False},
 }
 
-CORE_COLUMNS = ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Minutos_Std","Semana","Fuente","Usuario"]
+CORE_COLUMNS = ["DEPTO","COLUMNA","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Minutos_Std","Semana","Fuente","Usuario","Estimado"]
 
 # ------------------ Auditoría ------------------
 def log_audit(user: str, action: str, record_id: Optional[int], details: Dict[str, Any]):
@@ -248,7 +223,7 @@ if "user" not in st.session_state:
     st.session_state.user = None
     st.session_state.role = None
 
-# ------------------ Modo API (query params) ------------------
+# ------------------ API "lite" por query params ------------------
 qp = st.query_params
 if qp.get("api", [None])[0] == "ingest":
     token = qp.get("token", [None])[0]
@@ -274,7 +249,7 @@ if qp.get("api", [None])[0] == "ingest":
         "DEPTO": payload["DEPTO"], "COLUMNA": payload["COLUMNA"], "EMPLEADO": payload["EMPLEADO"], "MODELO": payload["MODELO"],
         "Produce": payload["Produce"], "Inicio": inicio, "Fin": fin,
         "Minutos_Proceso": minutos_proceso, "Minutos_Std": payload["Minutos_Std"],
-        "Semana": week_number(inicio), "Fuente": "API", "Usuario": "api-client",
+        "Semana": week_number(inicio), "Fuente": "API", "Usuario": "api-client", "Estimado": False,
     }
     db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
     save_parquet(db, DB_FILE); log_audit("api-client", "create", int(len(db)-1), {"via":"api", "row": row})
@@ -284,7 +259,6 @@ if qp.get("api", [None])[0] == "ingest":
 if not st.session_state.user:
     login_box(); st.stop()
 
-# Define permisos UNA VEZ y reúsalos
 perms = ROLE_PERMS.get(st.session_state.role, ROLE_PERMS["Supervisor"])
 
 st.sidebar.success(f"Sesión: {st.session_state.user} ({st.session_state.role})")
@@ -300,20 +274,24 @@ with tabs[0]:
     if not perms["editable"]:
         st.info("Tu rol no tiene permisos para capturar.")
     else:
-        # Listas desplegables desde historial
+        # Catálogos + historial
         db_prev = load_parquet(DB_FILE)
-        empleados_hist = sorted([x for x in db_prev["EMPLEADO"].dropna().astype(str).unique().tolist()]) if not db_prev.empty and "EMPLEADO" in db_prev.columns else []
-        modelos_hist = sorted([x for x in db_prev["MODELO"].dropna().astype(str).unique().tolist()]) if not db_prev.empty and "MODELO" in db_prev.columns else []
+        empleados_hist = sorted(db_prev["EMPLEADO"].dropna().astype(str).unique().tolist()) if (not db_prev.empty and "EMPLEADO" in db_prev.columns) else []
+        modelos_hist   = sorted(db_prev["MODELO"].dropna().astype(str).unique().tolist())   if (not db_prev.empty and "MODELO"  in db_prev.columns) else []
+        empleados_cat = load_catalog(CAT_EMP, "empleado")
+        modelos_cat   = load_catalog(CAT_MOD, "modelo")
+        empleados_opts = sorted(list(dict.fromkeys(empleados_cat + empleados_hist)))
+        modelos_opts   = sorted(list(dict.fromkeys(modelos_cat + modelos_hist)))
 
         with st.form("form_captura", clear_on_submit=True):
             c1, c2 = st.columns(2)
             with c1:
-                emp_choice = st.selectbox("Empleado*", options=(["— Selecciona —"] + empleados_hist + ["Otro…"]))
+                emp_choice = st.selectbox("Empleado*", options=(["— Selecciona —"] + empleados_opts + ["Otro…"]))
                 empleado_manual = st.text_input("Empleado (nuevo)*", placeholder="Nombre o ID") if emp_choice=="Otro…" else ""
                 depto = st.selectbox("Departamento*", options=["TAPIZ","COSTURA","CARPINTERIA","COJINERIA","CORTE","ARMADO","HILADO","COLCHONETA","OTRO"])
                 col_depto = st.number_input("Columna (depto)*", min_value=1, step=1, value=1)
             with c2:
-                modelo_choice = st.selectbox("Modelo*", options=(["— Selecciona —"] + modelos_hist + ["Otro…"]))
+                modelo_choice = st.selectbox("Modelo*", options=(["— Selecciona —"] + modelos_opts + ["Otro…"]))
                 modelo_manual = st.text_input("Modelo (nuevo)*", placeholder="Ej. MARIE 2 GAIA") if modelo_choice=="Otro…" else ""
                 produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1)
                 minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0)
@@ -324,6 +302,14 @@ with tabs[0]:
                 if not empleado or not modelo:
                     st.error("Empleado y Modelo son obligatorios.")
                 else:
+                    # Aprender nuevos valores al catálogo
+                    if empleado and (empleado not in empleados_cat):
+                        save_catalog(CAT_EMP, "empleado", empleados_cat + [empleado])
+                        empleados_cat.append(empleado)
+                    if modelo and (modelo not in modelos_cat):
+                        save_catalog(CAT_MOD, "modelo", modelos_cat + [modelo])
+                        modelos_cat.append(modelo)
+
                     inicio = datetime.now()
                     fin = inicio
                     minutos_proceso = float(minutos_std) * float(produce)  # estimado rápido
@@ -462,11 +448,54 @@ with tabs[4]:
     else:
         st.subheader("Administración")
         st.code("user,role,pin\nadmin,Admin,1234\nsupervisor,Supervisor,1111\nnominas,Nominas,2222\nrrhh,RRHH,3333\nproductividad,Productividad,4444", language="text")
-        st.markdown("**API** (token via `st.secrets['API_TOKEN']` o var de entorno `API_TOKEN`):")
-        st.code("""# GET
-# ?api=ingest&token=TU_TOKEN&data=<base64url(JSON)>
-# JSON ejemplo:
-{"DEPTO":"TAPIZ","COLUMNA":10,"EMPLEADO":"L1-36","MODELO":"SALLY 3-2","Produce":12,"Inicio":"2025-09-17T08:00:00","Fin":"2025-09-17T09:00:00","Minutos_Std":20}""", language="json")
+
+        st.markdown("### Catálogos")
+        emp_cat = load_catalog(CAT_EMP, "empleado")
+        mod_cat = load_catalog(CAT_MOD, "modelo")
+        cA, cB = st.columns(2)
+        with cA:
+            st.caption("Empleados")
+            st.dataframe(pd.DataFrame({"empleado": emp_cat}), hide_index=True, use_container_width=True)
+            nuevo_emp = st.text_input("➕ Agregar empleado")
+            if st.button("Guardar empleado"):
+                save_catalog(CAT_EMP, "empleado", emp_cat + ([nuevo_emp] if str(nuevo_emp).strip() else []))
+                st.success("Catálogo de empleados actualizado"); st.rerun()
+            st.download_button("⬇️ Descargar empleados.csv",
+                               data=pd.DataFrame({"empleado": emp_cat}).to_csv(index=False).encode("utf-8"),
+                               file_name="cat_empleados.csv", mime="text/csv")
+            up_emp = st.file_uploader("Subir empleados.csv", type=["csv"], key="up_emp")
+            if up_emp is not None:
+                try:
+                    dfu = pd.read_csv(up_emp, dtype=str)
+                    if "empleado" in dfu.columns:
+                        save_catalog(CAT_EMP, "empleado", dfu["empleado"].dropna().astype(str).tolist())
+                        st.success("Cargado cat_empleados.csv"); st.rerun()
+                    else:
+                        st.error("El CSV debe tener columna 'empleado'.")
+                except Exception as e:
+                    st.error(f"CSV inválido: {e}")
+
+        with cB:
+            st.caption("Modelos")
+            st.dataframe(pd.DataFrame({"modelo": mod_cat}), hide_index=True, use_container_width=True)
+            nuevo_mod = st.text_input("➕ Agregar modelo")
+            if st.button("Guardar modelo"):
+                save_catalog(CAT_MOD, "modelo", mod_cat + ([nuevo_mod] if str(nuevo_mod).strip() else []))
+                st.success("Catálogo de modelos actualizado"); st.rerun()
+            st.download_button("⬇️ Descargar modelos.csv",
+                               data=pd.DataFrame({"modelo": mod_cat}).to_csv(index=False).encode("utf-8"),
+                               file_name="cat_modelos.csv", mime="text/csv")
+            up_mod = st.file_uploader("Subir modelos.csv", type=["csv"], key="up_mod")
+            if up_mod is not None:
+                try:
+                    dfu = pd.read_csv(up_mod, dtype=str)
+                    if "modelo" in dfu.columns:
+                        save_catalog(CAT_MOD, "modelo", dfu["modelo"].dropna().astype(str).tolist())
+                        st.success("Cargado cat_modelos.csv"); st.rerun()
+                    else:
+                        st.error("El CSV debe tener columna 'modelo'.")
+                except Exception as e:
+                    st.error(f"CSV inválido: {e}")
 
         st.markdown("---")
         db = load_parquet(DB_FILE); st.write(f"Registros: {len(db)}")
@@ -479,4 +508,4 @@ with tabs[4]:
                 os.remove(DB_FILE) if os.path.exists(DB_FILE) else None
                 st.success("Base de datos borrada"); st.rerun()
 
-st.caption("© 2025 · Destajo móvil con roles, auditoría y API.")
+st.caption("© 2025 · Destajo móvil con roles, auditoría, API y catálogos.")
