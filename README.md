@@ -5,7 +5,7 @@
 - **Login con roles** (Admin, Supervisor, Nominas, RRHH, Productividad) vía `users.csv` (usuario + PIN).
 - **Captura móvil** para supervisores: Día/Hora inicio/fin, Minutos_Std por pieza, Produce, etc.
 - **Tablero** con KPIs y filtros (depto, semana, empleado).
-- **Cálculo exacto desde Excel** replicando las fórmulas de tu hoja **Tiempos** (Eficiencia, Destajo Unitario, Pago Total) usando la tabla de **DEPARTAMENTOS** para $/hr.
+- **Cálculo exacto desde Excel**Tiempos** (Eficiencia, Destajo Unitario, Pago Total) usando la tabla de **DEPARTAMENTOS** para $/hr.
 - **Admin**: gestión simple de `users.csv` y exportación/borrado de la base local.
 
 ## Archivos clave
