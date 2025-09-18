@@ -1,7 +1,7 @@
-# app.py — Destajo con Horarios, Tarifas por Área (Excel), Catálogos por Depto, PDFs y Auditoría
+# app.py — Destajo con Horarios, Tarifas desde Excel, Catálogos por Depto, PDFs, Tablero y Nómina
 # © 2025
 
-import os, json, base64, re, hashlib, math
+import os, json, base64, re, hashlib, math, io
 from datetime import datetime, date, time, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -23,13 +23,14 @@ AUDIT_FILE = os.path.join(DATA_DIR, "audit.parquet")
 USERS_FILE = "users.csv"
 
 # Catálogos
-CAT_EMP = os.path.join(DATA_DIR, "cat_empleados.csv")   # columnas: departamento,empleado
+CAT_EMP = os.path.join(DATA_DIR, "cat_empleados.csv")   # columnas: departamento,empleado,(opcional) orden
 CAT_MOD = os.path.join(DATA_DIR, "cat_modelos.csv")     # columna: modelo
 
 # Tarifas (área)
 RATES_CSV = os.path.join(DATA_DIR, "rates.csv")         # normalizado desde Excel (hoja 'tiempos')
 RATES_XLSX = os.path.join(DATA_DIR, "rates_source.xlsx")
 DEFAULT_RATE_SHEET = "tiempos"
+WEEKLY_HOURS_DEFAULT = 55  # de tu hoja
 
 # Documentos PDF
 DOCS_DIR = os.path.join(DATA_DIR, "docs")
@@ -122,9 +123,25 @@ def working_minutes_between(start: datetime, end: datetime) -> float:
 # =========================
 # Tarifas por área (Excel -> CSV normalizado)
 # =========================
+def find_col(df: pd.DataFrame, keys: List[str]) -> Optional[str]:
+    for key in keys:
+        for c in df.columns:
+            if key in c:
+                return c
+    return None
+
 def normalize_rates(df_in: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza tarifas por área desde tu Excel:
+      - Detecta columna de departamento (depto/area/área/…)
+      - Si hay columna $/hr, la usa como precio_hora
+      - Si hay columna semanal ($ sem, semana, semanal), deriva precio_hora = semanal / WEEKLY_HOURS_DEFAULT
+      - Calcula precio_minuto = precio_hora / 60 si hace falta
+    """
+    cols_out = ["DEPTO", "precio_minuto", "precio_pieza", "precio_hora"]
     if df_in is None or df_in.empty:
-        return pd.DataFrame(columns=["DEPTO", "precio_minuto", "precio_pieza", "precio_hora"])
+        return pd.DataFrame(columns=cols_out)
+
     df = df_in.copy()
     df.columns = [c.strip().lower() for c in df.columns]
 
@@ -137,31 +154,40 @@ def normalize_rates(df_in: pd.DataFrame) -> pd.DataFrame:
         cand = [c for c in df.columns if "dept" in c or "area" in c or "área" in c]
         dep_col = cand[0] if cand else None
     if dep_col is None:
-        return pd.DataFrame(columns=["DEPTO", "precio_minuto", "precio_pieza", "precio_hora"])
+        return pd.DataFrame(columns=cols_out)
 
     out = pd.DataFrame({"DEPTO": df[dep_col].astype(str).str.strip().str.upper()})
 
-    def find_col(keys: List[str]) -> Optional[str]:
-        for key in keys:
-            for c in df.columns:
-                if key in c:
-                    return c
-        return None
+    c_hr = find_col(df, ["$/hr", "precio_hora", "por_hora", "x_hora", "hora"])
+    c_week = find_col(df, ["sem", "semana", "semanal", "$ semana", "$/sem"])
+    c_min = find_col(df, ["precio_minuto", "por_min", "x_min", "minuto"])
+    c_pza = find_col(df, ["precio_pieza", "por_pieza", "x_pieza", "pieza"])
 
-    c_min = find_col(["precio_minuto", "minuto", "x_min", "por_min"])
-    c_pza = find_col(["precio_pieza", "pieza", "x_pieza", "por_pieza"])
-    c_hr  = find_col(["precio_hora", "hora", "x_hora", "por_hora"])
+    if c_hr and c_hr in df.columns:
+        precio_hora = pd.to_numeric(df[c_hr], errors="coerce")
+    elif c_week and c_week in df.columns:
+        semanal = pd.to_numeric(df[c_week], errors="coerce")
+        precio_hora = (semanal / float(WEEKLY_HOURS_DEFAULT)).round(2)
+    else:
+        precio_hora = pd.Series([np.nan] * len(df))
 
-    for name, col in [("precio_minuto", c_min), ("precio_pieza", c_pza), ("precio_hora", c_hr)]:
-        if col and col in df.columns:
-            out[name] = pd.to_numeric(df[col], errors="coerce")
-        else:
-            out[name] = np.nan
+    if c_min and c_min in df.columns:
+        precio_min = pd.to_numeric(df[c_min], errors="coerce")
+    else:
+        precio_min = (precio_hora / 60.0).round(4)
 
-    out = out.groupby("DEPTO", as_index=False).agg(
-        {"precio_minuto": "max", "precio_pieza": "max", "precio_hora": "max"}
-    )
-    return out
+    if c_pza and c_pza in df.columns:
+        precio_pza = pd.to_numeric(df[c_pza], errors="coerce")
+    else:
+        precio_pza = pd.Series([np.nan] * len(df))
+
+    out["precio_hora"] = precio_hora
+    out["precio_minuto"] = precio_min
+    out["precio_pieza"] = precio_pza
+
+    out = (out.groupby("DEPTO", as_index=False)
+             .agg({"precio_minuto":"max","precio_pieza":"max","precio_hora":"max"}))
+    return out[cols_out]
 
 def load_rates_csv() -> pd.DataFrame:
     if os.path.exists(RATES_CSV):
@@ -251,39 +277,47 @@ if st.sidebar.button("Cerrar sesión"):
     st.rerun()
 
 # =========================
-# Catálogos
+# Catálogos (preservar orden del CSV)
 # =========================
 def load_emp_catalog() -> pd.DataFrame:
+    """Lee cat_empleados.csv y preserva el orden de aparición; si hay columna 'orden', la usa dentro de cada depto."""
     if os.path.exists(CAT_EMP):
         try:
-            df = pd.read_csv(CAT_EMP, dtype=str).fillna("")
-            for c in ["departamento", "empleado"]:
-                if c not in df.columns:
-                    return pd.DataFrame(columns=["departamento", "empleado"])
-            df["departamento"] = df["departamento"].str.strip().str.upper()
-            df["empleado"] = df["empleado"].str.replace(r"\s+", " ", regex=True).str.strip()
-            df = df[(df["departamento"] != "") & (df["empleado"] != "")]
-            df = df.drop_duplicates(subset=["departamento", "empleado"])
-            return df.sort_values(["departamento", "empleado"]).reset_index(drop=True)
+            df = pd.read_csv(CAT_EMP, dtype=str, keep_default_na=False)
+            df.columns = [c.strip().lower() for c in df.columns]
+            if not {"departamento","empleado"}.issubset(df.columns):
+                return pd.DataFrame(columns=["departamento","empleado"])
+            df["departamento"] = df["departamento"].astype(str).str.strip().str.upper()
+            df["empleado"] = df["empleado"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+            df = df[(df["departamento"]!="") & (df["empleado"]!="")]
+            df = df.drop_duplicates(subset=["departamento","empleado"], keep="first")
+            if "orden" in df.columns:
+                df["__orden"] = pd.to_numeric(df["orden"], errors="coerce")
+                df = df.sort_values(by=["departamento","__orden"], kind="stable")
+                df = df.drop(columns=["__orden"])
+            return df.reset_index(drop=True)
         except Exception:
             pass
-    return pd.DataFrame(columns=["departamento", "empleado"])
+    return pd.DataFrame(columns=["departamento","empleado"])
 
 def save_emp_catalog(df: pd.DataFrame):
     os.makedirs(os.path.dirname(CAT_EMP), exist_ok=True)
     if df is None:
-        df = pd.DataFrame(columns=["departamento", "empleado"])
-    out = (df.fillna("")
-            .assign(departamento=lambda d: d["departamento"].str.strip().str.upper(),
-                    empleado=lambda d: d["empleado"].str.replace(r"\s+", " ", regex=True).str.strip()))
-    out = out[(out["departamento"] != "") & (out["empleado"] != "")]
-    out = out.drop_duplicates(subset=["departamento", "empleado"]).sort_values(["departamento", "empleado"])
-    out.to_csv(CAT_EMP, index=False)
+        df = pd.DataFrame(columns=["departamento","empleado"])
+    df = df.fillna("")
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "departamento" in df.columns:
+        df["departamento"] = df["departamento"].astype(str).str.strip().str.upper()
+    if "empleado" in df.columns:
+        df["empleado"] = df["empleado"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+    df = df[(df["departamento"]!="") & (df["empleado"]!="")]
+    df = df.drop_duplicates(subset=["departamento","empleado"], keep="first")
+    df.to_csv(CAT_EMP, index=False)
 
 def emp_options_for(depto: str) -> List[str]:
     dep = str(depto).upper()
     cat = load_emp_catalog()
-    return sorted(cat.loc[cat["departamento"] == dep, "empleado"].dropna().astype(str).unique().tolist())
+    return cat.loc[cat["departamento"]==dep, "empleado"].astype(str).tolist()
 
 def load_model_catalog() -> List[str]:
     if os.path.exists(CAT_MOD):
@@ -291,13 +325,13 @@ def load_model_catalog() -> List[str]:
             df = pd.read_csv(CAT_MOD, dtype=str)
             if "modelo" in df.columns:
                 items = [x.strip() for x in df["modelo"].dropna().astype(str).tolist() if x.strip()]
-                return sorted(list(dict.fromkeys(items)))
+                return list(dict.fromkeys(items))  # preserva orden de archivo
         except Exception:
             pass
     return []
 
 def save_model_catalog(items: List[str]):
-    clean = sorted(list(dict.fromkeys([str(x).strip() for x in items if str(x).strip()])))
+    clean = list(dict.fromkeys([str(x).strip() for x in items if str(x).strip()]))
     pd.DataFrame({"modelo": clean}).to_csv(CAT_MOD, index=False)
 
 # =========================
@@ -384,6 +418,76 @@ def show_pdf_file(path: str, height: int = 680):
             st.download_button("⬇️ Descargar PDF", data=data, file_name=os.path.basename(path), mime="application/pdf", use_container_width=True)
     except Exception as e:
         st.error(f"No se pudo mostrar/servir el PDF: {e}")
+
+# =========================
+# Derivados en vivo (minutos/pago) y export Nómina
+# =========================
+def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFrame:
+    """Agrega columnas derivadas: Minutos_Calc, Pago_Calc, Esquema_Calc, Tarifa_Calc.
+       Si Minutos_Proceso/Pago están vacíos o 0, muestra los calculados."""
+    if df.empty:
+        return df
+    d = df.copy()
+    if "Inicio" in d.columns:
+        d["Inicio"] = pd.to_datetime(d["Inicio"], errors="coerce")
+    if "Fin" in d.columns:
+        d["Fin"] = pd.to_datetime(d["Fin"], errors="coerce")
+
+    def mins_row(r):
+        ini, fin = r.get("Inicio"), r.get("Fin")
+        if pd.notna(ini) and pd.notna(fin) and ini != fin:
+            return working_minutes_between(ini, fin)
+        return float(r.get("Minutos_Proceso", 0) or 0)
+
+    d["Minutos_Calc"] = d.apply(mins_row, axis=1).astype(float)
+
+    def pay_row(r):
+        p, esq, tar = calc_pago_row(
+            str(r.get("DEPTO","")).upper(),
+            num(r.get("Produce"), 0.0),
+            float(r.get("Minutos_Calc", 0.0)),
+            num(r.get("Minutos_Std"), 0.0),
+            rates
+        )
+        return pd.Series({"Pago_Calc": p, "Esquema_Calc": esq, "Tarifa_Calc": tar})
+
+    d = pd.concat([d, d.apply(pay_row, axis=1)], axis=1)
+
+    if "Minutos_Proceso" in d.columns:
+        d["Minutos_Proceso"] = np.where(pd.to_numeric(d["Minutos_Proceso"], errors="coerce").fillna(0) > 0,
+                                        d["Minutos_Proceso"], d["Minutos_Calc"])
+    else:
+        d["Minutos_Proceso"] = d["Minutos_Calc"]
+
+    if "Pago" in d.columns:
+        d["Pago"] = np.where(pd.to_numeric(d["Pago"], errors="coerce").fillna(0) > 0,
+                             d["Pago"], d["Pago_Calc"])
+    else:
+        d["Pago"] = d["Pago_Calc"]
+
+    d["Minutos_Proceso"] = d["Minutos_Proceso"].round(2)
+    d["Pago"] = d["Pago"].round(2)
+    return d
+
+def export_nomina(df: pd.DataFrame) -> bytes:
+    """Genera un XLSX con:
+       - Detalle por registro
+       - Totales por empleado/semana
+    """
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as xw:
+        # Detalle
+        detalle_cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana"] if c in df.columns]
+        df[detalle_cols].to_excel(xw, index=False, sheet_name="Detalle")
+        # Totales
+        if {"EMPLEADO","Semana","Pago","Minutos_Proceso"}.issubset(df.columns):
+            agg = (df.groupby(["EMPLEADO","Semana"], dropna=False)
+                     .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
+                     .reset_index())
+            agg["Horas"] = (agg["Minutos"] / 60).round(2)
+            agg["Pagos"] = agg["Pagos"].round(2)
+            agg.to_excel(xw, index=False, sheet_name="Nomina")
+    return output.getvalue()
 
 # =========================
 # Tabs
@@ -495,20 +599,23 @@ with tabs[0]:
                 st.success("Registro guardado ✅ (si había uno abierto, se cerró con minutos efectivos y pago).")
 
 # =========================
-# 📈 Tablero
+# 📈 Tablero (con cálculo en vivo y export)
 # =========================
 with tabs[1]:
     st.subheader("Producción en vivo")
     base = load_parquet(DB_FILE)
+    rates = load_rates_csv()
     if base.empty:
         st.info("Sin registros.")
     else:
+        show = compute_minutes_and_pay(base, rates)
+
         c1, c2, c3 = st.columns(3)
-        f_depto = c1.multiselect("Departamento", sorted(base["DEPTO"].dropna().astype(str).unique().tolist()) if "DEPTO" in base.columns else [])
-        f_semana = c2.multiselect("Semana", sorted(pd.to_numeric(base["Semana"], errors="coerce").dropna().unique().tolist()) if "Semana" in base.columns else [])
+        f_depto = c1.multiselect("Departamento", sorted(show["DEPTO"].dropna().astype(str).unique().tolist()) if "DEPTO" in show.columns else [])
+        f_semana = c2.multiselect("Semana", sorted(pd.to_numeric(show["Semana"], errors="coerce").dropna().unique().tolist()) if "Semana" in show.columns else [])
         f_emp = c3.text_input("Empleado (contiene)")
 
-        fdf = base.copy()
+        fdf = show.copy()
         if not fdf.empty:
             if f_depto:
                 fdf = fdf[fdf["DEPTO"].astype(str).isin(f_depto)]
@@ -517,7 +624,23 @@ with tabs[1]:
             if f_emp:
                 fdf = fdf[fdf["EMPLEADO"].astype(str).str.contains(f_emp, case=False, na=False)]
 
-        st.dataframe(fdf.sort_values(by="Inicio", ascending=False), use_container_width=True, hide_index=True)
+        cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana"] if c in fdf.columns]
+        st.dataframe(fdf.sort_values(by="Inicio", ascending=False)[cols],
+                     use_container_width=True, hide_index=True)
+
+        st.markdown("**Totales por empleado y semana**")
+        if {"EMPLEADO","Semana","Pago","Minutos_Proceso"}.issubset(fdf.columns):
+            agg = (fdf.groupby(["EMPLEADO","Semana"], dropna=False)
+                     .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
+                     .reset_index())
+            agg["Horas"] = (agg["Minutos"] / 60).round(2)
+            agg["Pagos"] = agg["Pagos"].round(2)
+            st.dataframe(agg.sort_values(["Semana","EMPLEADO"]), use_container_width=True, hide_index=True)
+
+            # Exportar nómina
+            xls = export_nomina(fdf)
+            st.download_button("⬇️ Exportar nómina (Excel)", data=xls, file_name=f"nomina_{date.today().isoformat()}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
 # =========================
 # 📚 Plantillas & Diagramas (PDF)
@@ -530,7 +653,6 @@ with tabs[2]:
     st.subheader("Plantillas & Diagramas (PDF)")
     st.caption("Sube y consulta PDFs por departamento. Vista previa + descarga.")
 
-    # Upload (solo Admin)
     if st.session_state.role == "Admin":
         with st.expander("⬆️ Subir nuevo PDF", expanded=False):
             up_depto = st.selectbox("Departamento", DEPT_OPTIONS, key="up_depto")
@@ -564,7 +686,6 @@ with tabs[2]:
                     ensure_pdf_thumbnail(relpath)
                     st.success("PDF guardado e indexado ✅")
 
-    # Buscador
     idx = load_docs_index_or_empty()
     if idx.empty:
         st.info("Aún no hay documentos. (Admin puede subirlos arriba)")
@@ -770,4 +891,4 @@ with tabs[4]:
                 except Exception as e:
                     st.error(f"No pude leer el Excel: {e}")
 
-st.caption("© 2025 · Destajo móvil con horarios, tarifas por área, catálogos, visor de PDFs y auditoría.")
+st.caption("© 2025 · Destajo móvil con horarios, tarifas por área, catálogos, visor de PDFs, tablero y nómina.")
