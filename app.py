@@ -40,6 +40,16 @@ os.makedirs(THUMBS_DIR, exist_ok=True)
 
 DEPT_OPTIONS = ["COSTURA","TAPIZ","CARPINTERIA","COJINERIA","CORTE","ARMADO","HILADO","COLCHONETA","OTRO"]
 
+def num(val, default=0.0):
+    """Convierte a float de forma segura; NaN/None/'' -> default."""
+    try:
+        x = float(val)
+        if math.isnan(x):
+            return default
+        return x
+    except Exception:
+        return default
+
 # =========================
 # Utils
 # =========================
@@ -434,27 +444,55 @@ with tabs[0]:
                     abiertos = db[(db["EMPLEADO"].astype(str)==str(empleado)) &
                                   db["Inicio"].notna() & db["Fin"].notna() &
                                   (db["Inicio"]==db["Fin"])]
-                    if not abiertos.empty:
-                        idx_last = abiertos.index[-1]
-                        ini_prev = pd.to_datetime(db.at[idx_last,"Inicio"])
-                        fin_prev = ahora
-                        minutos_ef = working_minutes_between(ini_prev, fin_prev)
-                        db.at[idx_last,"Fin"] = fin_prev
-                        db.at[idx_last,"Minutos_Proceso"] = minutos_ef
-                        pago, esquema, tarifa = calc_pago_row(
-                            db.at[idx_last,"DEPTO"],
-                            float(db.at[idx_last].get("Produce",0) or 0),
-                            minutos_ef,
-                            float(db.at[idx_last].get("Minutos_Std",0) or 0),
-                            rates
-                        )
-                        db.at[idx_last,"Pago"] = pago
-                        db.at[idx_last,"Esquema_Pago"] = esquema
-                        db.at[idx_last,"Tarifa_Base"] = tarifa
-                        save_parquet(db, DB_FILE)
-                        log_audit(st.session_state.user, "auto-close", int(idx_last),
-                                  {"empleado": empleado, "cerrado": fin_prev, "minutos_efectivos": minutos_ef, "pago": pago})
+# --- Cerrar trabajo abierto del mismo empleado (Inicio==Fin)
+if not db.empty and {"EMPLEADO","Inicio","Fin"}.issubset(db.columns):
+    try:
+        db["Inicio"] = pd.to_datetime(db["Inicio"], errors="coerce")
+        db["Fin"]    = pd.to_datetime(db["Fin"],    errors="coerce")
+    except Exception:
+        pass
 
+    abiertos = db[
+        (db["EMPLEADO"].astype(str)==str(empleado)) &
+        db["Inicio"].notna() & db["Fin"].notna() &
+        (db["Inicio"]==db["Fin"])
+    ]
+
+    if not abiertos.empty:
+        idx_last = abiertos.index[-1]
+        ini_prev = pd.to_datetime(db.at[idx_last, "Inicio"])
+        fin_prev = ahora
+
+        # minutos efectivos (con horarios y sin comida)
+        minutos_ef = working_minutes_between(ini_prev, fin_prev)
+
+        # valores numéricos seguros
+        produce_prev = num(db.at[idx_last, "Produce"] if "Produce" in db.columns else 0.0)
+        min_std_prev = num(db.at[idx_last, "Minutos_Std"] if "Minutos_Std" in db.columns else 0.0)
+
+        # actualizar registro cerrado
+        db.at[idx_last, "Fin"] = fin_prev
+        db.at[idx_last, "Minutos_Proceso"] = minutos_ef
+
+        # calcular pago según tarifas por área
+        pago, esquema, tarifa = calc_pago_row(
+            str(db.at[idx_last, "DEPTO"]).strip().upper(),
+            produce_prev,
+            minutos_ef,
+            min_std_prev,
+            rates
+        )
+        db.at[idx_last, "Pago"] = pago
+        db.at[idx_last, "Esquema_Pago"] = esquema
+        db.at[idx_last, "Tarifa_Base"] = tarifa
+        db.at[idx_last, "Estimado"] = False
+
+        save_parquet(db, DB_FILE)
+        log_audit(
+            st.session_state.user, "auto-close", int(idx_last),
+            {"empleado": empleado, "cerrado": fin_prev, "minutos_efectivos": minutos_ef, "pago": pago}
+        )
+                    
                 # Nuevo registro "abierto"
                 row = {
                     "DEPTO": str(depto).strip().upper(),
@@ -592,6 +630,13 @@ with tabs[2]:
 # =========================
 # ✏️ Editar / Auditar
 # =========================
+
+produce_val = num(produce)
+min_std_val = num(min_std)
+pago, esquema, tarifa = calc_pago_row(
+    str(depto).strip().upper(), produce_val, minutos_ef, min_std_val, rates
+)
+
 with tabs[3]:
     st.subheader("Edición (solo Admin mueve tiempos) + Bitácora")
     db = load_parquet(DB_FILE)
