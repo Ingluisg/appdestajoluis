@@ -854,30 +854,34 @@ with tabs[3]:
                     st.write("Inicio:", ini_raw)
                     st.write("Fin:", fin_raw)
                     inicio, fin = ini_raw, fin_raw
+submitted = st.form_submit_button("💾 Guardar cambios")
+if submitted:
+    before = db.iloc[int(idx_num)].to_dict()
 
-            submitted = st.form_submit_button("💾 Guardar cambios")
-            if submitted:
-                before = db.iloc[int(idx_num)].to_dict()
-                db.at[int(idx_num), "DEPTO"] = norm_depto(depto)
-                db.at[int(idx_num), "EMPLEADO"] = empleado
-                db.at[int[idx_num), "MODELO"] = modelo
-                db.at[int[idx_num), "Produce"] = num(produce)
-                db.at[int[idx_num), "Minutos_Std"] = num(min_std)
-                if st.session_state.role == "Admin":
-                    db.at[int[idx_num), "Inicio"] = inicio
-                    db.at[int[idx_num), "Fin"] = fin
-                    minutos_ef = working_minutes_between(inicio, fin)
-                    db.at[int[idx_num), "Minutos_Proceso"] = minutos_ef
-                    pago, esquema, tarifa = calc_pago_row(
-                        norm_depto(depto), num(produce), minutos_ef, num(min_std), rates
-                    )
-                    db.at[int[idx_num), "Pago"] = pago
-                    db.at[int[idx_num), "Esquema_Pago"] = esquema
-                    db.at[int[idx_num), "Tarifa_Base"] = tarifa
-                save_parquet(db, DB_FILE)
-                after = db.iloc[int(idx_num)].to_dict()
-                log_audit(st.session_state.user, "update", int(idx_num), {"before": before, "after": after})
-                st.success("Actualizado ✅")
+    db.at[int(idx_num), "DEPTO"] = norm_depto(depto)
+    db.at[int(idx_num), "EMPLEADO"] = empleado
+    db.at[int(idx_num), "MODELO"] = modelo
+    db.at[int(idx_num), "Produce"] = num(produce)
+    db.at[int(idx_num), "Minutos_Std"] = num(min_std)
+
+    if st.session_state.role == "Admin":
+        db.at[int(idx_num), "Inicio"] = inicio
+        db.at[int(idx_num), "Fin"] = fin
+
+        minutos_ef = working_minutes_between(inicio, fin)
+        db.at[int(idx_num), "Minutos_Proceso"] = minutos_ef
+
+        pago, esquema, tarifa = calc_pago_row(
+            norm_depto(depto), num(produce), minutos_ef, num(min_std), rates
+        )
+        db.at[int(idx_num), "Pago"] = pago
+        db.at[int(idx_num), "Esquema_Pago"] = esquema
+        db.at[int(idx_num), "Tarifa_Base"] = tarifa
+
+    save_parquet(db, DB_FILE)
+    after = db.iloc[int(idx_num)].to_dict()
+    log_audit(st.session_state.user, "update", int(idx_num), {"before": before, "after": after})
+    st.success("Actualizado ✅")
 
         st.markdown("---")
         st.subheader("Bitácora")
