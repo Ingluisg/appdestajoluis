@@ -1,7 +1,0 @@
-streamlit==1.32.0
-pandas
-numpy
-openpyxl
-pyarrow
-streamlit-pdf-viewer==0.0.15
-pymupdf==1.24.9
