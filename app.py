@@ -1,10 +1,12 @@
-# app.py — Destajo con Roles, Auditoría, API y Catálogos por Departamento
-# - Departamento controla el desplegable de Empleado
-# - Solo Admin puede editar tiempos
-# - Cierre automático del trabajo previo del mismo empleado
-# - Sin campo "Columna (depto)"
+# app.py — Destajo + Catálogos por Depto + Cierre Automático + Visor/Buscador de PDFs
+# Requisitos recomendados (requirements.txt):
+# streamlit==1.32.0
+# pandas
+# numpy
+# openpyxl
+# pyarrow
 
-import os, json, base64
+import os, json, base64, re
 from datetime import datetime, date
 from typing import Optional, Dict, Any, List
 
@@ -12,19 +14,28 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-APP_TITLE = "Destajo · Roles + Auditoría + API"
+APP_TITLE = "Destajo · Roles + Auditoría + Plantillas"
 st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="centered")
 
+# ------------------ Paths & Constantes ------------------
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
-DB_FILE = os.path.join(DATA_DIR, "registros.parquet")
-AUDIT_FILE = os.path.join(DATA_DIR, "audit.parquet")
-USERS_FILE = "users.csv"
 
-# ------------------ Constantes ------------------
+DB_FILE     = os.path.join(DATA_DIR, "registros.parquet")
+AUDIT_FILE  = os.path.join(DATA_DIR, "audit.parquet")
+USERS_FILE  = "users.csv"
+
+# Catálogos
+CAT_EMP     = os.path.join(DATA_DIR, "cat_empleados.csv")  # columnas: departamento,empleado
+CAT_MOD     = os.path.join(DATA_DIR, "cat_modelos.csv")    # columna: modelo
+
+# Documentos (PDFs)
+DOCS_DIR    = os.path.join(DATA_DIR, "docs")
+DOCS_INDEX  = os.path.join(DATA_DIR, "docs_index.csv")     # columnas: id,departamento,titulo,tags,filename,relpath,uploaded_by,ts
+
 DEPT_OPTIONS = ["COSTURA","TAPIZ","CARPINTERIA","COJINERIA","CORTE","ARMADO","HILADO","COLCHONETA","OTRO"]
 
-# ------------------ Utilidades ------------------
+# ------------------ Utils ------------------
 def now_iso(): return datetime.now().isoformat(timespec="seconds")
 
 def week_number(dt: Optional[datetime]):
@@ -41,13 +52,19 @@ def save_parquet(df: pd.DataFrame, path: str):
     if df is None or df.empty: return
     df.to_parquet(path, index=False)
 
+def sanitize_filename(name: str) -> str:
+    base = re.sub(r"[^\w\-. ]+", "_", str(name))
+    return re.sub(r"\s+", "_", base).strip("_")
+
+# ------------------ Users ------------------
 def load_users():
     if os.path.exists(USERS_FILE):
         try:
             df = pd.read_csv(USERS_FILE, dtype=str)
             df.columns = [c.strip().lower() for c in df.columns]
             return df
-        except: pass
+        except:
+            pass
     return pd.DataFrame([
         {"user":"admin","role":"Admin","pin":"1234"},
         {"user":"supervisor","role":"Supervisor","pin":"1111"},
@@ -57,30 +74,21 @@ def load_users():
     ])
 
 # ------------------ Catálogos ------------------
-CAT_EMP = os.path.join(DATA_DIR, "cat_empleados.csv")  # columnas: departamento,empleado
-CAT_MOD = os.path.join(DATA_DIR, "cat_modelos.csv")    # columna: modelo
-
 def load_emp_catalog() -> pd.DataFrame:
     if os.path.exists(CAT_EMP):
         try:
             df = pd.read_csv(CAT_EMP, dtype=str)
-            want = ["departamento","empleado"]
-            for c in want:
-                if c not in df.columns: return pd.DataFrame(columns=want)
+            for c in ["departamento","empleado"]:
+                if c not in df.columns: return pd.DataFrame(columns=["departamento","empleado"])
             df = df.dropna(subset=["empleado"])
             df["departamento"] = df["departamento"].str.strip().str.upper()
             df["empleado"] = df["empleado"].str.strip()
-            # dedupe
-            df = df.drop_duplicates(subset=["departamento","empleado"]).sort_values(["departamento","empleado"])
-            return df
-        except:
-            pass
+            return df.drop_duplicates(subset=["departamento","empleado"]).sort_values(["departamento","empleado"])
+        except: pass
     return pd.DataFrame(columns=["departamento","empleado"])
 
 def save_emp_catalog(df: pd.DataFrame):
     os.makedirs(os.path.dirname(CAT_EMP), exist_ok=True)
-    if not {"departamento","empleado"}.issubset(df.columns):
-        return
     out = (df.dropna(subset=["empleado"])
              .assign(departamento=lambda d: d["departamento"].str.strip().str.upper(),
                      empleado=lambda d: d["empleado"].str.strip()))
@@ -88,14 +96,13 @@ def save_emp_catalog(df: pd.DataFrame):
     out.drop_duplicates(subset=["departamento","empleado"]).sort_values(["departamento","empleado"]).to_csv(CAT_EMP, index=False)
 
 def emp_options_for(depto: str, db_hist: pd.DataFrame) -> List[str]:
-    cat = load_emp_catalog()
     dep = str(depto).strip().upper()
+    cat = load_emp_catalog()
     cat_list = cat.loc[cat["departamento"]==dep, "empleado"].dropna().astype(str).tolist()
     hist_list = []
-    if not db_hist.empty and "EMPLEADO" in db_hist.columns and "DEPTO" in db_hist.columns:
+    if not db_hist.empty and {"EMPLEADO","DEPTO"}.issubset(db_hist.columns):
         hist_list = db_hist.loc[db_hist["DEPTO"].astype(str).str.upper()==dep, "EMPLEADO"].dropna().astype(str).unique().tolist()
-    merged = sorted(list(dict.fromkeys(cat_list + hist_list)))
-    return merged
+    return sorted(list(dict.fromkeys(cat_list + hist_list)))
 
 def add_emp_to_catalog(depto: str, empleado: str):
     dep = str(depto).strip().upper()
@@ -119,6 +126,42 @@ def save_model_catalog(items: List[str]):
     clean = sorted(list(dict.fromkeys([str(x).strip() for x in items if str(x).strip()])))
     pd.DataFrame({"modelo": clean}).to_csv(CAT_MOD, index=False)
 
+# ------------------ Docs (PDF) ------------------
+def load_docs_index() -> pd.DataFrame:
+    if os.path.exists(DOCS_INDEX):
+        try:
+            df = pd.read_csv(DOCS_INDEX, dtype=str)
+            for c in ["id","departamento","titulo","tags","filename","relpath","uploaded_by","ts"]:
+                if c not in df.columns: return pd.DataFrame(columns=["id","departamento","titulo","tags","filename","relpath","uploaded_by","ts"])
+            return df
+        except: pass
+    return pd.DataFrame(columns=["id","departamento","titulo","tags","filename","relpath","uploaded_by","ts"])
+
+def save_docs_index(df: pd.DataFrame):
+    os.makedirs(DOCS_DIR, exist_ok=True)
+    df.to_csv(DOCS_INDEX, index=False)
+
+def add_pdf_to_index(depto: str, titulo: str, tags: str, filename: str, relpath: str, user: str):
+    idx = load_docs_index()
+    new_id = str(int(idx["id"].max())+1) if not idx.empty else "1"
+    row = {"id": new_id, "departamento": dep.toUpper if False else str(depto).strip().upper(),
+           "titulo": titulo.strip(), "tags": tags.strip(), "filename": filename, "relpath": relpath,
+           "uploaded_by": user, "ts": now_iso()}
+    idx = pd.concat([idx, pd.DataFrame([row])], ignore_index=True)
+    save_docs_index(idx)
+
+def embed_pdf(path: str, height: int = 720):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode()
+        st.components.v1.html(
+            f"""<iframe src="data:application/pdf;base64,{b64}" width="100%" height="{height}" style="border:none;"></iframe>""",
+            height=height+10,
+        )
+    except Exception as e:
+        st.error(f"No se pudo mostrar el PDF: {e}")
+
 # ------------------ Permisos ------------------
 ROLE_PERMS = {
     "Admin": {"editable": True, "columns_view": "all", "can_delete": True},
@@ -133,7 +176,8 @@ def log_audit(user: str, action: str, record_id: Optional[int], details: Dict[st
     payload = json.dumps(details, ensure_ascii=False,
                          default=lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o))
     aud = load_parquet(AUDIT_FILE)
-    row = {"ts": now_iso(), "user": user, "action": action, "record_id": int(record_id) if record_id is not None else None, "details": payload}
+    row = {"ts": now_iso(), "user": user, "action": action,
+           "record_id": int(record_id) if record_id is not None else None, "details": payload}
     aud = pd.concat([aud, pd.DataFrame([row])], ignore_index=True)
     save_parquet(aud, AUDIT_FILE)
 
@@ -152,50 +196,24 @@ def login_box():
         else: st.error("Usuario o PIN incorrectos.")
 
 if "user" not in st.session_state: st.session_state.user, st.session_state.role = None, None
-
-# ------------------ API "lite" por query params ------------------
-qp = st.query_params
-if qp.get("api", [None])[0] == "ingest":
-    token = qp.get("token", [None])[0]
-    allowed = token and (token == (st.secrets.get("API_TOKEN") if hasattr(st, "secrets") else os.getenv("API_TOKEN","devtoken")))
-    if not allowed:
-        st.write({"ok": False, "error": "TOKEN_INVALIDO"}); st.stop()
-    b64 = qp.get("data", [None])[0]
-    if not b64:
-        st.write({"ok": False, "error": "FALTA_DATA"}); st.stop()
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(b64 + "==="))
-    except Exception as e:
-        st.write({"ok": False, "error": f"JSON_INVALIDO: {e}"}); st.stop()
-    required = ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Std"]
-    missing = [k for k in required if k not in payload]
-    if missing:
-        st.write({"ok": False, "error": f"FALTAN_CAMPOS: {missing}"}); st.stop()
-    db = load_parquet(DB_FILE)
-    inicio = pd.to_datetime(payload["Inicio"], errors="coerce")
-    fin = pd.to_datetime(payload["Fin"], errors="coerce")
-    minutos_proceso = (fin - inicio).total_seconds()/60.0 if pd.notna(inicio) and pd.notna(fin) else np.nan
-    row = {
-        "DEPTO": str(payload["DEPTO"]).strip().upper(), "EMPLEADO": payload["EMPLEADO"], "MODELO": payload["MODELO"],
-        "Produce": payload["Produce"], "Inicio": inicio, "Fin": fin,
-        "Minutos_Proceso": minutos_proceso, "Minutos_Std": payload["Minutos_Std"],
-        "Semana": week_number(inicio), "Usuario": "api-client", "Estimado": False,
-    }
-    db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
-    save_parquet(db, DB_FILE); log_audit("api-client", "create", int(len(db)-1), {"via":"api", "row": row})
-    st.write({"ok": True, "inserted_id": int(len(db)-1)}); st.stop()
-
-# ------------------ UI ------------------
 if not st.session_state.user:
     login_box(); st.stop()
 
 perms = ROLE_PERMS.get(st.session_state.role, ROLE_PERMS["Supervisor"])
+
 st.sidebar.success(f"Sesión: {st.session_state.user} ({st.session_state.role})")
 if st.sidebar.button("Cerrar sesión"):
     for k in ["user","role"]: st.session_state.pop(k, None)
     st.rerun()
 
-tabs = st.tabs(["📲 Captura", "📈 Tablero", "✏️ Editar / Auditar", "🛠️ Admin"])
+# ------------------ Tabs ------------------
+tabs = st.tabs([
+    "📲 Captura",
+    "📈 Tablero",
+    "📚 Plantillas & Diagramas",
+    "✏️ Editar / Auditar",
+    "🛠️ Admin",
+])
 
 # -------- 📲 Captura --------
 with tabs[0]:
@@ -209,12 +227,10 @@ with tabs[0]:
             c1, c2 = st.columns(2)
             with c1:
                 depto = st.selectbox("Departamento*", options=DEPT_OPTIONS, index=0)
-                # Empleado depende del departamento
                 empleados_opts = emp_options_for(depto, db_prev)
                 emp_choice = st.selectbox("Empleado*", ["— Selecciona —"] + empleados_opts + ["Otro…"])
                 empleado_manual = st.text_input("Empleado (nuevo)*", placeholder="Nombre/ID") if emp_choice=="Otro…" else ""
             with c2:
-                # Modelos (globales, pero puedes segmentarlos igual si lo pides)
                 modelos_hist = sorted(db_prev["MODELO"].dropna().astype(str).unique().tolist()) if "MODELO" in db_prev.columns else []
                 modelos_cat = load_model_catalog()
                 modelos_opts = sorted(list(dict.fromkeys(modelos_cat + modelos_hist)))
@@ -223,22 +239,20 @@ with tabs[0]:
                 produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1)
                 minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0)
 
-            # --- Botón agregar ---
             if st.form_submit_button("➕ Agregar registro", use_container_width=True):
                 empleado = empleado_manual if emp_choice=="Otro…" else (emp_choice if emp_choice!="— Selecciona —" else "")
-                modelo = modelo_manual if modelo_choice=="Otro…" else (modelo_choice if modelo_choice!="— Selecciona —" else "")
+                modelo   = modelo_manual   if modelo_choice=="Otro…" else (modelo_choice   if modelo_choice  != "— Selecciona —" else "")
                 if not empleado or not modelo:
                     st.error("Empleado y Modelo son obligatorios.")
                 else:
-                    # Aprender en catálogos
-                    if emp_choice=="Otro…":
-                        add_emp_to_catalog(depto, empleado)
-                    if modelo_choice=="Otro…":
-                        save_model_catalog(list(set(load_model_catalog()+[modelo])))
+                    # aprender en catálogos
+                    if emp_choice=="Otro…": add_emp_to_catalog(depto, empleado)
+                    if modelo_choice=="Otro…": save_model_catalog(list(set(load_model_catalog()+[modelo])))
 
-                    # Cerrar trabajo abierto del mismo empleado
                     ahora = datetime.now()
                     db = load_parquet(DB_FILE)
+
+                    # Cerrar trabajo abierto del mismo empleado
                     if not db.empty and {"EMPLEADO","Inicio","Fin"}.issubset(db.columns):
                         try:
                             db["Inicio"] = pd.to_datetime(db["Inicio"], errors="coerce")
@@ -261,8 +275,8 @@ with tabs[0]:
                         "MODELO": modelo,
                         "Produce": produce,
                         "Inicio": ahora,
-                        "Fin": ahora,                # abierto hasta que se asigne otra tarea o se cierre
-                        "Minutos_Proceso": 0.0,      # se calculará al cerrar
+                        "Fin": ahora,            # abierto
+                        "Minutos_Proceso": 0.0,  # se calculará al cerrar
                         "Minutos_Std": minutos_std,
                         "Semana": week_number(ahora),
                         "Usuario": st.session_state.user,
@@ -272,7 +286,7 @@ with tabs[0]:
                     db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
                     save_parquet(db, DB_FILE)
                     log_audit(st.session_state.user, "create", int(len(db)-1), {"via":"ui", "row": row})
-                    st.success("Registro guardado ✅ (cierre automático del previo si existía)")
+                    st.success("Registro guardado ✅")
 
 # -------- 📈 Tablero --------
 with tabs[1]:
@@ -294,22 +308,96 @@ with tabs[1]:
 
         st.dataframe(fdf.sort_values(by="Inicio", ascending=False), use_container_width=True, hide_index=True)
 
-# -------- ✏️ Editar / Auditar --------
+# -------- 📚 Plantillas & Diagramas (PDF) --------
 with tabs[2]:
+    st.subheader("Plantillas & Diagramas (PDF)")
+    st.caption("Sube PDFs y consúltalos por departamento. Ej.: corte de tela, costura, carpintería, armado, resorte, cojinera, delcron y tapiz.")
+
+    # Upload (solo Admin)
+    if st.session_state.role == "Admin":
+        with st.expander("⬆️ Subir nuevo PDF", expanded=False):
+            up_depto = st.selectbox("Departamento", DEPT_OPTIONS, key="up_depto")
+            up_title = st.text_input("Título o descripción")
+            up_tags  = st.text_input("Etiquetas (separadas por comas)", placeholder="corte, guía, plantilla A")
+            up_file  = st.file_uploader("Archivo PDF", type=["pdf"])
+            if st.button("Guardar PDF", type="primary"):
+                if not up_file:
+                    st.error("Adjunta un PDF.")
+                else:
+                    dep_dir = os.path.join(DOCS_DIR, sanitize_filename(up_depto))
+                    os.makedirs(dep_dir, exist_ok=True)
+                    safe_name = sanitize_filename(up_file.name)
+                    save_path = os.path.join(dep_dir, safe_name)
+                    with open(save_path, "wb") as f: f.write(up_file.read())
+                    relpath = os.path.relpath(save_path, ".")
+                    # indexar
+                    idx = load_docs_index()
+                    new_id = str(int(idx["id"].max())+1) if not idx.empty else "1"
+                    row = {"id": new_id,
+                           "departamento": str(up_depto).strip().upper(),
+                           "titulo": up_title.strip() if up_title else safe_name,
+                           "tags": up_tags.strip(),
+                           "filename": safe_name,
+                           "relpath": relpath.replace("\\","/"),
+                           "uploaded_by": st.session_state.user,
+                           "ts": now_iso()}
+                    idx = pd.concat([idx, pd.DataFrame([row])], ignore_index=True)
+                    save_docs_index(idx)
+                    st.success("PDF guardado e indexado ✅")
+
+    # Buscador
+    idx = load_docs_index()
+    if idx.empty:
+        st.info("Aún no hay documentos. (Admin puede subirlos aquí arriba)")
+    else:
+        c1, c2 = st.columns([1,2])
+        dept_filter = c1.multiselect("Departamento", DEPT_OPTIONS)
+        q = c2.text_input("Buscar (título / tags / archivo)", placeholder="ej. corte, plantilla, tapiz...")
+
+        df = idx.copy()
+        if dept_filter:
+            df = df[df["departamento"].isin([d.upper() for d in dept_filter])]
+        if q.strip():
+            qq = q.strip().lower()
+            df = df[df.apply(lambda r: any(qq in str(r[col]).lower() for col in ["titulo","tags","filename"]), axis=1)]
+
+        df = df.sort_values(by="ts", ascending=False).reset_index(drop=True)
+        st.write(f"{len(df)} documento(s) encontrado(s).")
+
+        for i, r in df.iterrows():
+            with st.expander(f"📄 {r['titulo']} · {r['departamento']} · {r['filename']}", expanded=False):
+                path = r["relpath"]
+                if not os.path.isabs(path):
+                    path = os.path.join(".", path)
+                col1, col2 = st.columns([3,1])
+                with col1:
+                    embed_pdf(path, height=680)
+                with col2:
+                    try:
+                        with open(path, "rb") as f: data = f.read()
+                        st.download_button("⬇️ Descargar", data=data, file_name=os.path.basename(path), mime="application/pdf", use_container_width=True)
+                    except Exception as e:
+                        st.error(f"No se pudo preparar la descarga: {e}")
+                st.caption(f"Etiquetas: {r['tags'] or '—'} · Subido por: {r['uploaded_by']} · {r['ts']}")
+
+# -------- ✏️ Editar / Auditar --------
+with tabs[3]:
     st.subheader("Edición (solo Admin mueve tiempos) + Bitácora")
     db = load_parquet(DB_FILE)
     if db.empty:
         st.info("No hay datos para editar.")
     else:
-        idx = st.number_input("ID de registro (0 .. n-1)", min_value=0, max_value=len(db)-1, step=1, value=0)
-        row = db.iloc[int(idx)].to_dict()
+        idx_num = st.number_input("ID de registro (0 .. n-1)", min_value=0, max_value=len(db)-1, step=1, value=0)
+        row = db.iloc[int(idx_num)].to_dict()
         st.write("Registro actual:", row)
 
         if perms["editable"]:
             with st.form("edit_form"):
                 c1, c2 = st.columns(2)
                 with c1:
-                    depto = st.selectbox("Departamento", options=DEPT_OPTIONS, index=max(0, DEPT_OPTIONS.index(str(row.get("DEPTO","OTRO")).upper())) if str(row.get("DEPTO","")).upper() in DEPT_OPTIONS else 0)
+                    depto = st.selectbox("Departamento", options=DEPT_OPTIONS,
+                                         index=max(0, DEPT_OPTIONS.index(str(row.get("DEPTO","OTRO")).upper()))
+                                         if str(row.get("DEPTO","")).upper() in DEPT_OPTIONS else 0)
                     empleado = st.text_input("Empleado", value=str(row.get("EMPLEADO","")))
                     modelo = st.text_input("Modelo", value=str(row.get("MODELO","")))
                     produce = st.number_input("Produce", value=int(row.get("Produce") or 0), min_value=0)
@@ -331,19 +419,19 @@ with tabs[2]:
 
                 submitted = st.form_submit_button("💾 Guardar cambios")
                 if submitted:
-                    before = db.iloc[int(idx)].to_dict()
-                    db.at[int(idx),"DEPTO"] = str(depto).strip().upper()
-                    db.at[int(idx),"EMPLEADO"] = empleado
-                    db.at[int(idx),"MODELO"] = modelo
-                    db.at[int(idx),"Produce"] = produce
-                    db.at[int(idx),"Minutos_Std"] = min_std
+                    before = db.iloc[int(idx_num)].to_dict()
+                    db.at[int(idx_num),"DEPTO"] = str(depto).strip().upper()
+                    db.at[int(idx_num),"EMPLEADO"] = empleado
+                    db.at[int(idx_num),"MODELO"] = modelo
+                    db.at[int(idx_num),"Produce"] = produce
+                    db.at[int(idx_num),"Minutos_Std"] = min_std
                     if st.session_state.role=="Admin":
-                        db.at[int(idx),"Inicio"] = inicio
-                        db.at[int(idx),"Fin"] = fin
-                        db.at[int(idx),"Minutos_Proceso"] = (pd.to_datetime(fin) - pd.to_datetime(inicio)).total_seconds()/60.0
+                        db.at[int(idx_num),"Inicio"] = inicio
+                        db.at[int(idx_num),"Fin"] = fin
+                        db.at[int(idx_num),"Minutos_Proceso"] = (pd.to_datetime(fin) - pd.to_datetime(inicio)).total_seconds()/60.0
                     save_parquet(db, DB_FILE)
-                    after = db.iloc[int(idx)].to_dict()
-                    log_audit(st.session_state.user, "update", int(idx), {"before": before, "after": after})
+                    after = db.iloc[int(idx_num)].to_dict()
+                    log_audit(st.session_state.user, "update", int(idx_num), {"before": before, "after": after})
                     st.success("Actualizado ✅")
 
         st.markdown("---")
@@ -355,58 +443,13 @@ with tabs[2]:
             st.dataframe(audit.sort_values(by="ts", ascending=False).head(300), use_container_width=True, hide_index=True)
 
 # -------- 🛠️ Admin --------
-with tabs[3]:
+with tabs[4]:
     if st.session_state.role!="Admin":
         st.info("Solo Admin puede administrar.")
     else:
         st.subheader("Catálogo de Empleados por Departamento")
         emp_cat = load_emp_catalog()
-        # Editor simple
         cA, cB = st.columns([1,2])
         with cA:
             dep_new = st.selectbox("Departamento", DEPT_OPTIONS, index=0, key="dep_new")
             emp_new = st.text_input("➕ Empleado nuevo")
-            if st.button("Guardar empleado"):
-                if emp_new.strip():
-                    add_emp_to_catalog(dep_new, emp_new.strip())
-                    st.success("Empleado agregado al catálogo"); st.rerun()
-        with cB:
-            st.dataframe(emp_cat, use_container_width=True, hide_index=True)
-        st.download_button("⬇️ Descargar cat_empleados.csv", data=emp_cat.to_csv(index=False).encode("utf-8"),
-                           file_name="cat_empleados.csv", mime="text/csv")
-        up_emp = st.file_uploader("Subir cat_empleados.csv", type=["csv"])
-        if up_emp is not None:
-            try:
-                dfu = pd.read_csv(up_emp, dtype=str)
-                if {"departamento","empleado"}.issubset(dfu.columns):
-                    save_emp_catalog(dfu)
-                    st.success("Catálogo de empleados actualizado"); st.rerun()
-                else:
-                    st.error("El CSV debe tener columnas: departamento, empleado")
-            except Exception as e:
-                st.error(f"CSV inválido: {e}")
-
-        st.markdown("---")
-        st.subheader("Catálogo de Modelos (global)")
-        mod_cat_list = load_model_catalog()
-        st.dataframe(pd.DataFrame({"modelo": mod_cat_list}), use_container_width=True, hide_index=True)
-        nuevo_mod = st.text_input("➕ Modelo nuevo")
-        if st.button("Guardar modelo"):
-            save_model_catalog(list(set(mod_cat_list + ([nuevo_mod] if nuevo_mod.strip() else []))))
-            st.success("Modelo agregado"); st.rerun()
-        st.download_button("⬇️ Descargar cat_modelos.csv",
-                           data=pd.DataFrame({"modelo": load_model_catalog()}).to_csv(index=False).encode("utf-8"),
-                           file_name="cat_modelos.csv", mime="text/csv")
-        up_mod = st.file_uploader("Subir cat_modelos.csv", type=["csv"], key="up_mod")
-        if up_mod is not None:
-            try:
-                dfm = pd.read_csv(up_mod, dtype=str)
-                if "modelo" in dfm.columns:
-                    save_model_catalog(dfm["modelo"].dropna().astype(str).tolist())
-                    st.success("Catálogo de modelos actualizado"); st.rerun()
-                else:
-                    st.error("El CSV debe tener columna: modelo")
-            except Exception as e:
-                st.error(f"CSV inválido: {e}")
-
-st.caption("© 2025 · Destajo móvil con roles, auditoría, API y catálogos por departamento.")
