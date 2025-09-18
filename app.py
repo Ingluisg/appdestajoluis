@@ -1,21 +1,21 @@
-# app.py — Destajo + Catálogos por Depto + Cierre Automático + Visor/Buscador de PDFs (con miniaturas)
+# app.py — Destajo con Horario Laboral, Tarifas por Área (desde Excel), Catálogos por Depto, PDFs con miniaturas
 # © 2025
 
-import os, json, base64, re, hashlib
-from datetime import datetime, date
-from typing import Optional, Dict, Any, List
+import os, json, base64, re, hashlib, math
+from datetime import datetime, date, time, timedelta
+from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 # =========================
-# Config básica
+# Config
 # =========================
-APP_TITLE = "Destajo · Roles + Auditoría + Plantillas"
+APP_TITLE = "Destajo · Horario + Tarifas + Plantillas"
 st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="centered")
 
-DATA_DIR = "data"
+DATA_DIR   = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_FILE     = os.path.join(DATA_DIR, "registros.parquet")
@@ -23,12 +23,17 @@ AUDIT_FILE  = os.path.join(DATA_DIR, "audit.parquet")
 USERS_FILE  = "users.csv"
 
 # Catálogos
-CAT_EMP     = os.path.join(DATA_DIR, "cat_empleados.csv")  # columnas: departamento,empleado
-CAT_MOD     = os.path.join(DATA_DIR, "cat_modelos.csv")    # columna: modelo
+CAT_EMP     = os.path.join(DATA_DIR, "cat_empleados.csv")   # columnas: departamento,empleado
+CAT_MOD     = os.path.join(DATA_DIR, "cat_modelos.csv")     # columna: modelo
+
+# Tarifas (área)
+RATES_CSV   = os.path.join(DATA_DIR, "rates.csv")           # normalizado desde un Excel subido
+RATES_XLSX  = os.path.join(DATA_DIR, "rates_source.xlsx")   # última subida
+RATES_SHEET = "tiempos"                                     # hoja por defecto
 
 # Documentos (PDFs)
 DOCS_DIR    = os.path.join(DATA_DIR, "docs")
-DOCS_INDEX  = os.path.join(DATA_DIR, "docs_index.csv")     # id,departamento,titulo,tags,filename,relpath,uploaded_by,ts
+DOCS_INDEX  = os.path.join(DATA_DIR, "docs_index.csv")      # id,departamento,titulo,tags,filename,relpath,uploaded_by,ts
 THUMBS_DIR  = os.path.join(DOCS_DIR, "thumbs")
 os.makedirs(THUMBS_DIR, exist_ok=True)
 
@@ -66,6 +71,134 @@ def hash_relpath(relpath: str) -> str:
     return hashlib.sha1(relpath.encode("utf-8")).hexdigest()[:16]
 
 # =========================
+# Horario laboral (cálculo de minutos efectivos)
+# =========================
+# Ventanas laborales por día:
+#  - L-V: 07:30–14:00  y 15:00–18:30  (se excluye 14:00–15:00 comida)
+#  - Sáb: 07:30–13:30
+#  - Dom: 0
+LUNCH_FROM = time(14, 0)
+LUNCH_TO   = time(15, 0)
+
+def day_windows(dt: date) -> List[Tuple[time, time]]:
+    wd = dt.weekday()  # 0=Mon ... 6=Sun
+    if wd <= 4:  # L-V
+        return [(time(7,30), time(14,0)), (time(15,0), time(18,30))]
+    if wd == 5:  # Sáb
+        return [(time(7,30), time(13,30))]
+    return []
+
+def overlap_minutes(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> float:
+    start = max(a_start, b_start)
+    end   = min(a_end, b_end)
+    if end <= start:
+        return 0.0
+    return (end - start).total_seconds() / 60.0
+
+def working_minutes_between(start: datetime, end: datetime) -> float:
+    """Suma minutos dentro de ventanas laborales por día; excluye comida (por definición de ventanas)."""
+    if pd.isna(start) or pd.isna(end):
+        return 0.0
+    if end < start:
+        start, end = end, start
+    total = 0.0
+    cur = start.date()
+    last = end.date()
+    while cur <= last:
+        windows = day_windows(cur)
+        for w_from, w_to in windows:
+            ws = datetime.combine(cur, w_from)
+            we = datetime.combine(cur, w_to)
+            total += overlap_minutes(start, end, ws, we)
+        cur += timedelta(days=1)
+    # redondeo a 2 decimales
+    return round(total, 2)
+
+# =========================
+# Tarifas por área (desde Excel hoja "tiempos")
+# =========================
+def load_rates_csv() -> pd.DataFrame:
+    if os.path.exists(RATES_CSV):
+        try:
+            df = pd.read_csv(RATES_CSV, dtype=str)
+            return normalize_rates(df)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["DEPTO","precio_minuto","precio_pieza","precio_hora"])
+
+def normalize_rates(df_in: pd.DataFrame) -> pd.DataFrame:
+    df = df_in.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    # Detectar columna de departamento
+    dep_col = None
+    for c in df.columns:
+        if c in ["depto","departamento","area","área"]:
+            dep_col = c
+            break
+    if dep_col is None and "depto" not in df.columns:
+        # si viene de otro formato, abortamos a frame vacío válido
+        return pd.DataFrame(columns=["DEPTO","precio_minuto","precio_pieza","precio_hora"])
+
+    df["DEPTO"] = df[dep_col].astype(str).str.strip().str.upper()
+    # Intentar mapear precios
+    def find_col(cands: List[str]) -> Optional[str]:
+        for c in df.columns:
+            for key in cands:
+                if key in c:
+                    return c
+        return None
+    c_min = find_col(["precio_minuto","minuto","x_min","por_min"])
+    c_pza = find_col(["precio_pieza","pieza","x_pieza","por_pieza"])
+    c_hr  = find_col(["precio_hora","hora","x_hora","por_hora"])
+
+    out = pd.DataFrame({"DEPTO": df["DEPTO"].dropna().astype(str)})
+    for name, col in [("precio_minuto", c_min), ("precio_pieza", c_pza), ("precio_hora", c_hr)]:
+        if col and col in df.columns:
+            out[name] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            out[name] = np.nan
+
+    # dedupe por DEPTO, tomando la 1ª aparición con datos
+    out = (out.groupby("DEPTO", as_index=False)
+              .agg({"precio_minuto":"max","precio_pieza":"max","precio_hora":"max"}))
+    return out
+
+def save_rates_csv(df_rates: pd.DataFrame):
+    if df_rates is None or df_rates.empty:
+        pd.DataFrame(columns=["DEPTO","precio_minuto","precio_pieza","precio_hora"]).to_csv(RATES_CSV, index=False)
+        return
+    df = normalize_rates(df_rates)
+    df.to_csv(RATES_CSV, index=False)
+
+def calc_pago_row(depto: str, produce: float, minutos_ef: float, minutos_std: float, rates: pd.DataFrame) -> Tuple[float,str,float]:
+    """
+    Devuelve (pago, esquema, tarifa_base)
+    prioridad: precio_minuto -> precio_pieza -> precio_hora
+    si no hay tarifa, intenta: produce * minutos_std * precio_minuto_global (si existiera DEPTO=GLOBAL)
+    """
+    dep = (depto or "").strip().upper()
+    r = rates[rates["DEPTO"]==dep]
+    tarifa_min = float(r["precio_minuto"].iloc[0]) if not r.empty and pd.notna(r["precio_minuto"].iloc[0]) else np.nan
+    tarifa_pza = float(r["precio_pieza"].iloc[0]) if not r.empty and pd.notna(r["precio_pieza"].iloc[0]) else np.nan
+    tarifa_hr  = float(r["precio_hora"].iloc[0])  if not r.empty and pd.notna(r["precio_hora"].iloc[0])  else np.nan
+
+    if not math.isnan(tarifa_min):
+        return (round(minutos_ef * tarifa_min, 2), "minuto", tarifa_min)
+    if not math.isnan(tarifa_pza):
+        return (round(produce * tarifa_pza, 2), "pieza", tarifa_pza)
+    if not math.isnan(tarifa_hr):
+        return (round((minutos_ef/60.0) * tarifa_hr, 2), "hora", tarifa_hr)
+
+    # fallback: buscar GLOBAL por minuto
+    r2 = rates[rates["DEPTO"]=="GLOBAL"]
+    if not r2.empty and pd.notna(r2["precio_minuto"].iloc[0]):
+        t = float(r2["precio_minuto"].iloc[0])
+        base_min = produce * (float(minutos_std) if pd.notna(minutos_std) else 0.0)
+        return (round(base_min * t, 2), "minuto_std", t)
+
+    return (0.0, "sin_tarifa", 0.0)
+
+# =========================
 # Usuarios
 # =========================
 def load_users() -> pd.DataFrame:
@@ -86,48 +219,40 @@ def load_users() -> pd.DataFrame:
     ])
 
 # =========================
-# Catálogos (empleados por depto / modelos global)
+# Catálogos
 # =========================
 def load_emp_catalog() -> pd.DataFrame:
-    if os.path.exists(CAT_EMP):
+    path = CAT_EMP
+    if os.path.exists(path):
         try:
-            df = pd.read_csv(CAT_EMP, dtype=str)
+            df = pd.read_csv(path, dtype=str).fillna("")
             for c in ["departamento","empleado"]:
                 if c not in df.columns:
                     return pd.DataFrame(columns=["departamento","empleado"])
-            df = df.dropna(subset=["empleado"])
             df["departamento"] = df["departamento"].str.strip().str.upper()
-            df["empleado"] = df["empleado"].str.strip()
-            return df.drop_duplicates(subset=["departamento","empleado"]).sort_values(["departamento","empleado"])
+            df["empleado"] = df["empleado"].str.replace(r"\s+", " ", regex=True).str.strip()
+            df = df[(df["departamento"]!="") & (df["empleado"]!="")]
+            df = df.drop_duplicates(subset=["departamento","empleado"])
+            return df.sort_values(["departamento","empleado"]).reset_index(drop=True)
         except Exception:
             pass
     return pd.DataFrame(columns=["departamento","empleado"])
 
 def save_emp_catalog(df: pd.DataFrame):
     os.makedirs(os.path.dirname(CAT_EMP), exist_ok=True)
-    out = (df.dropna(subset=["empleado"])
+    if df.empty:
+        pd.DataFrame(columns=["departamento","empleado"]).to_csv(CAT_EMP, index=False); return
+    out = (df.fillna("")
              .assign(departamento=lambda d: d["departamento"].str.strip().str.upper(),
-                     empleado=lambda d: d["empleado"].str.strip()))
+                     empleado=lambda d: d["empleado"].str.replace(r"\s+", " ", regex=True).str.strip()))
     out = out[(out["departamento"]!="") & (out["empleado"]!="")]
-    out.drop_duplicates(subset=["departamento","empleado"]).sort_values(["departamento","empleado"]).to_csv(CAT_EMP, index=False)
+    out = out.drop_duplicates(subset=["departamento","empleado"]).sort_values(["departamento","empleado"])
+    out.to_csv(CAT_EMP, index=False)
 
-def emp_options_for(depto: str, db_hist: pd.DataFrame) -> List[str]:
+def emp_options_for(depto: str) -> List[str]:
     dep = str(depto).strip().upper()
     cat = load_emp_catalog()
-    cat_list = cat.loc[cat["departamento"]==dep, "empleado"].dropna().astype(str).tolist()
-    hist_list = []
-    if not db_hist.empty and {"EMPLEADO","DEPTO"}.issubset(db_hist.columns):
-        hist_list = db_hist.loc[db_hist["DEPTO"].astype(str).str.upper()==dep, "EMPLEADO"].dropna().astype(str).unique().tolist()
-    return sorted(list(dict.fromkeys(cat_list + hist_list)))
-
-def add_emp_to_catalog(depto: str, empleado: str):
-    dep = str(depto).strip().upper()
-    emp = str(empleado).strip()
-    if not dep or not emp:
-        return
-    cat = load_emp_catalog()
-    cat = pd.concat([cat, pd.DataFrame([{"departamento": dep, "empleado": emp}])], ignore_index=True)
-    save_emp_catalog(cat)
+    return sorted(cat.loc[cat["departamento"]==dep, "empleado"].dropna().astype(str).unique().tolist())
 
 def load_model_catalog() -> List[str]:
     if os.path.exists(CAT_MOD):
@@ -165,28 +290,21 @@ def save_docs_index(df: pd.DataFrame):
     df.to_csv(DOCS_INDEX, index=False)
 
 def thumb_path_for(relpath: str) -> str:
-    # Usa un hash del relpath para nombre estable
     h = hash_relpath(relpath)
     base = os.path.splitext(os.path.basename(relpath))[0]
     return os.path.join(THUMBS_DIR, f"{base}_{h}.png")
 
 def ensure_pdf_thumbnail(relpath: str, max_w: int = 360, dpi: int = 110) -> Optional[str]:
-    """
-    Genera (si falta) una miniatura PNG de la primera página del PDF.
-    Devuelve ruta al PNG o None si falla.
-    """
     png_path = thumb_path_for(relpath)
     abs_pdf = relpath if os.path.isabs(relpath) else os.path.join(".", relpath)
     try:
         if os.path.exists(png_path):
             return png_path
-        # Render con PyMuPDF
         import fitz  # PyMuPDF
         doc = fitz.open(abs_pdf)
         if doc.page_count == 0:
             return None
         page = doc.load_page(0)
-        # calcular escala por ancho objetivo
         pix = page.get_pixmap(dpi=dpi)
         if pix.width > max_w:
             scale = max_w / pix.width
@@ -196,28 +314,21 @@ def ensure_pdf_thumbnail(relpath: str, max_w: int = 360, dpi: int = 110) -> Opti
         doc.close()
         return png_path if os.path.exists(png_path) else None
     except Exception:
-        # fall back: None
         return None
 
-# visor PDF amigable en móvil
 def show_pdf_file(path: str, height: int = 680):
     try:
         with open(path, "rb") as f:
             data = f.read()
         b64 = base64.b64encode(data).decode("utf-8")
-
-        # 1) PDF.js via streamlit-pdf-viewer (mejor en móvil)
         try:
             from streamlit_pdf_viewer import pdf_viewer
             pdf_viewer(b64, width=0, height=height, scrolling=True)
         except Exception:
-            # 2) Fallback: iframe data: (mejor en desktop)
             st.components.v1.html(
                 f"""<iframe src="data:application/pdf;base64,{b64}" width="100%" height="{height}" style="border:none;"></iframe>""",
                 height=height+10,
             )
-
-        # 3) Enlaces alternativos
         colA, colB = st.columns(2)
         with colA:
             st.markdown(
@@ -304,324 +415,15 @@ with tabs[0]:
     if not perms["editable"]:
         st.info("Sin permisos para capturar.")
     else:
-        db_prev = load_parquet(DB_FILE)
-
+        rates = load_rates_csv()  # tarifas cargadas
         with st.form("form_captura", clear_on_submit=True):
             c1, c2 = st.columns(2)
             with c1:
                 depto = st.selectbox("Departamento*", options=DEPT_OPTIONS, index=0)
-                empleados_opts = emp_options_for(depto, db_prev)
-                emp_choice = st.selectbox("Empleado*", ["— Selecciona —"] + empleados_opts + ["Otro…"])
-                empleado_manual = st.text_input("Empleado (nuevo)*", placeholder="Nombre/ID") if emp_choice=="Otro…" else ""
+                empleados_opts = emp_options_for(depto)
+                emp_choice = st.selectbox("Empleado*", ["— Selecciona —"] + empleados_opts)
             with c2:
-                modelos_hist = sorted(db_prev["MODELO"].dropna().astype(str).unique().tolist()) if "MODELO" in db_prev.columns else []
-                modelos_cat = load_model_catalog()
-                modelos_opts = sorted(list(dict.fromkeys(modelos_cat + modelos_hist)))
-                modelo_choice = st.selectbox("Modelo*", ["— Selecciona —"] + modelos_opts + ["Otro…"])
-                modelo_manual = st.text_input("Modelo (nuevo)*", placeholder="Ej. MARIE 2 GAIA") if modelo_choice=="Otro…" else ""
+                modelos_opts = load_model_catalog()
+                modelo_choice = st.selectbox("Modelo*", ["— Selecciona —"] + modelos_opts)
                 produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1)
-                minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0)
-
-            if st.form_submit_button("➕ Agregar registro", use_container_width=True):
-                empleado = empleado_manual if emp_choice=="Otro…" else (emp_choice if emp_choice!="— Selecciona —" else "")
-                modelo   = modelo_manual   if modelo_choice=="Otro…" else (modelo_choice if modelo_choice!="— Selecciona —" else "")
-                if not empleado or not modelo:
-                    st.error("Empleado y Modelo son obligatorios.")
-                else:
-                    # aprender en catálogos
-                    if emp_choice=="Otro…":
-                        add_emp_to_catalog(depto, empleado)
-                    if modelo_choice=="Otro…":
-                        save_model_catalog(list(set(load_model_catalog()+[modelo])))
-
-                    ahora = datetime.now()
-                    db = load_parquet(DB_FILE)
-
-                    # Cerrar trabajo abierto del mismo empleado (Inicio==Fin)
-                    if not db.empty and {"EMPLEADO","Inicio","Fin"}.issubset(db.columns):
-                        try:
-                            db["Inicio"] = pd.to_datetime(db["Inicio"], errors="coerce")
-                            db["Fin"] = pd.to_datetime(db["Fin"], errors="coerce")
-                        except Exception:
-                            pass
-                        abiertos = db[(db["EMPLEADO"].astype(str)==str(empleado)) &
-                                      db["Inicio"].notna() & db["Fin"].notna() &
-                                      (db["Inicio"]==db["Fin"])]
-                        if not abiertos.empty:
-                            idx_last = abiertos.index[-1]
-                            ini_prev = pd.to_datetime(db.at[idx_last,"Inicio"])
-                            db.at[idx_last,"Fin"] = ahora
-                            db.at[idx_last,"Minutos_Proceso"] = (ahora - ini_prev).total_seconds()/60.0
-                            db.at[idx_last,"Estimado"] = False
-                            save_parquet(db, DB_FILE)
-                            log_audit(st.session_state.user, "auto-close", int(idx_last), {"empleado": empleado, "cerrado": ahora})
-
-                    # Nuevo registro "abierto"
-                    row = {
-                        "DEPTO": str(depto).strip().upper(),
-                        "EMPLEADO": empleado,
-                        "MODELO": modelo,
-                        "Produce": produce,
-                        "Inicio": ahora,
-                        "Fin": ahora,            # abierto
-                        "Minutos_Proceso": 0.0,  # se calculará al cerrar
-                        "Minutos_Std": minutos_std,
-                        "Semana": week_number(ahora),
-                        "Usuario": st.session_state.user,
-                        "Estimado": True,
-                    }
-                    db = load_parquet(DB_FILE)
-                    db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
-                    save_parquet(db, DB_FILE)
-                    log_audit(st.session_state.user, "create", int(len(db)-1), {"via":"ui", "row": row})
-                    st.success("Registro guardado ✅ (si había uno abierto, se cerró)")
-
-# =========================
-# 📈 Tablero
-# =========================
-with tabs[1]:
-    st.subheader("Producción en vivo")
-    base = load_parquet(DB_FILE)
-    if base.empty:
-        st.info("Sin registros.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        f_depto = c1.multiselect("Departamento", sorted(base["DEPTO"].dropna().astype(str).unique().tolist()) if "DEPTO" in base.columns else [])
-        f_semana = c2.multiselect("Semana", sorted(pd.to_numeric(base["Semana"], errors="coerce").dropna().unique().tolist()) if "Semana" in base.columns else [])
-        f_emp = c3.text_input("Empleado (contiene)")
-
-        fdf = base.copy()
-        if not fdf.empty:
-            if f_depto: fdf = fdf[fdf["DEPTO"].astype(str).isin(f_depto)]
-            if f_semana: fdf = fdf[pd.to_numeric(fdf["Semana"], errors="coerce").isin(f_semana)]
-            if f_emp: fdf = fdf[fdf["EMPLEADO"].astype(str).str.contains(f_emp, case=False, na=False)]
-
-        st.dataframe(fdf.sort_values(by="Inicio", ascending=False), use_container_width=True, hide_index=True)
-
-# =========================
-# 📚 Plantillas & Diagramas (PDF) — con miniaturas
-# =========================
-with tabs[2]:
-    st.subheader("Plantillas & Diagramas (PDF)")
-    st.caption("Sube y consulta PDFs por departamento: corte de tela, costura, carpintería, armado, resorte, cojinera, delcrón, tapiz…")
-
-    # Upload (solo Admin)
-    if st.session_state.role == "Admin":
-        with st.expander("⬆️ Subir nuevo PDF", expanded=False):
-            up_depto = st.selectbox("Departamento", DEPT_OPTIONS, key="up_depto")
-            up_title = st.text_input("Título o descripción")
-            up_tags  = st.text_input("Etiquetas (separadas por comas)", placeholder="corte, guía, plantilla A")
-            up_file  = st.file_uploader("Archivo PDF", type=["pdf"])
-            if st.button("Guardar PDF", type="primary"):
-                if not up_file:
-                    st.error("Adjunta un PDF.")
-                else:
-                    dep_dir = os.path.join(DOCS_DIR, sanitize_filename(up_depto))
-                    os.makedirs(dep_dir, exist_ok=True)
-                    safe_name = sanitize_filename(up_file.name)
-                    save_path = os.path.join(dep_dir, safe_name)
-                    with open(save_path, "wb") as f:
-                        f.write(up_file.read())
-                    relpath = os.path.relpath(save_path, ".").replace("\\","/")
-
-                    # indexar
-                    idx = load_docs_index()
-                    new_id = str(int(idx["id"].max())+1) if not idx.empty else "1"
-                    row = {"id": new_id,
-                           "departamento": str(up_depto).strip().upper(),
-                           "titulo": (up_title.strip() if up_title else safe_name),
-                           "tags": up_tags.strip(),
-                           "filename": safe_name,
-                           "relpath": relpath,
-                           "uploaded_by": st.session_state.user,
-                           "ts": now_iso()}
-                    idx = pd.concat([idx, pd.DataFrame([row])], ignore_index=True)
-                    save_docs_index(idx)
-
-                    # generar miniatura ahora para que aparezca en el grid
-                    ensure_pdf_thumbnail(relpath)
-
-                    st.success("PDF guardado e indexado ✅")
-
-    # Buscador
-    idx = load_docs_index()
-    if idx.empty:
-        st.info("Aún no hay documentos. (Admin puede subirlos arriba)")
-    else:
-        c1, c2 = st.columns([1,2])
-        dept_filter = c1.multiselect("Departamento", DEPT_OPTIONS)
-        q = c2.text_input("Buscar (título / tags / archivo)", placeholder="ej. corte, plantilla, tapiz...")
-
-        df = idx.copy()
-        if dept_filter:
-            df = df[df["departamento"].isin([d.upper() for d in dept_filter])]
-        if q.strip():
-            qq = q.strip().lower()
-            df = df[df.apply(lambda r: any(qq in str(r[col]).lower() for col in ["titulo","tags","filename"]), axis=1)]
-
-        df = df.sort_values(by="ts", ascending=False).reset_index(drop=True)
-        st.write(f"{len(df)} documento(s) encontrado(s).")
-
-        # ---- Grid de tarjetas con miniatura ----
-        cols_per_row = 2 if st.session_state.get("_is_mobile", False) else 3
-        # heurística simple para mobile: ancho de la app < 520px
-        try:
-            # no hay API oficial; dejamos bandera manual si quieres menearlo
-            pass
-        except:
-            pass
-
-        # dibujar grid
-        for i in range(0, len(df), cols_per_row):
-            cols = st.columns(cols_per_row)
-            for j, (_, r) in enumerate(df.iloc[i:i+cols_per_row].iterrows()):
-                with cols[j]:
-                    path = r["relpath"]
-                    abs_path = path if os.path.isabs(path) else os.path.join(".", path)
-                    thumb = ensure_pdf_thumbnail(path)
-                    if thumb and os.path.exists(thumb):
-                        st.image(thumb, use_container_width=True)
-                    st.markdown(f"**{r['titulo']}**")
-                    st.caption(f"{r['departamento']} · {r['filename']}")
-                    # Acciones rápidas
-                    cta1, cta2 = st.columns(2)
-                    with cta1:
-                        if st.button("👁️ Ver", key=f"ver_{r['id']}"):
-                            st.session_state[f"open_{r['id']}"] = True
-                    with cta2:
-                        try:
-                            with open(abs_path, "rb") as f:
-                                data = f.read()
-                            st.download_button("⬇️ Descargar", data=data, file_name=os.path.basename(abs_path),
-                                               mime="application/pdf", key=f"dl_{r['id']}", use_container_width=True)
-                        except Exception as e:
-                            st.error(f"Descarga falló: {e}")
-                    # viewer embebido opcional bajo cada tarjeta si se presionó "Ver"
-                    if st.session_state.get(f"open_{r['id']}"):
-                        show_pdf_file(abs_path, height=600)
-                        st.divider()
-                    st.caption(f"Etiquetas: {r['tags'] or '—'} · Por: {r['uploaded_by']} · {r['ts']}")
-
-# =========================
-# ✏️ Editar / Auditar
-# =========================
-with tabs[3]:
-    st.subheader("Edición (solo Admin mueve tiempos) + Bitácora")
-    db = load_parquet(DB_FILE)
-    if db.empty:
-        st.info("No hay datos para editar.")
-    else:
-        idx_num = st.number_input("ID de registro (0 .. n-1)", min_value=0, max_value=len(db)-1, step=1, value=0)
-        row = db.iloc[int(idx_num)].to_dict()
-        st.write("Registro actual:", row)
-
-        if perms["editable"]:
-            with st.form("edit_form"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    depto = st.selectbox("Departamento", options=DEPT_OPTIONS,
-                                         index=max(0, DEPT_OPTIONS.index(str(row.get("DEPTO","OTRO")).upper()))
-                                         if str(row.get("DEPTO","")).upper() in DEPT_OPTIONS else 0)
-                    empleado = st.text_input("Empleado", value=str(row.get("EMPLEADO","")))
-                    modelo = st.text_input("Modelo", value=str(row.get("MODELO","")))
-                    produce = st.number_input("Produce", value=int(row.get("Produce") or 0), min_value=0)
-                    min_std = st.number_input("Minutos_Std", value=float(row.get("Minutos_Std") or 0.0), min_value=0.0, step=0.5)
-                with c2:
-                    ini_raw = pd.to_datetime(row.get("Inicio"), errors="coerce")
-                    fin_raw = pd.to_datetime(row.get("Fin"), errors="coerce")
-                    if st.session_state.role=="Admin":
-                        ini_date = st.date_input("Inicio (fecha)", ini_raw.date() if pd.notna(ini_raw) else date.today())
-                        ini_time = st.time_input("Inicio (hora)", ini_raw.time() if pd.notna(ini_raw) else datetime.now().time().replace(second=0, microsecond=0))
-                        fin_date = st.date_input("Fin (fecha)", fin_raw.date() if pd.notna(fin_raw) else date.today())
-                        fin_time = st.time_input("Fin (hora)", fin_raw.time() if pd.notna(fin_raw) else datetime.now().time().replace(second=0, microsecond=0))
-                        inicio = datetime.combine(ini_date, ini_time)
-                        fin = datetime.combine(fin_date, fin_time)
-                    else:
-                        st.write("Inicio:", ini_raw)
-                        st.write("Fin:", fin_raw)
-                        inicio, fin = ini_raw, fin_raw
-
-                submitted = st.form_submit_button("💾 Guardar cambios")
-                if submitted:
-                    before = db.iloc[int(idx_num)].to_dict()
-                    db.at[int(idx_num),"DEPTO"] = str(depto).strip().upper()
-                    db.at[int(idx_num),"EMPLEADO"] = empleado
-                    db.at[int(idx_num),"MODELO"] = modelo
-                    db.at[int(idx_num),"Produce"] = produce
-                    db.at[int(idx_num),"Minutos_Std"] = min_std
-                    if st.session_state.role=="Admin":
-                        db.at[int(idx_num),"Inicio"] = inicio
-                        db.at[int(idx_num),"Fin"] = fin
-                        db.at[int(idx_num),"Minutos_Proceso"] = (pd.to_datetime(fin) - pd.to_datetime(inicio)).total_seconds()/60.0
-                    save_parquet(db, DB_FILE)
-                    after = db.iloc[int(idx_num)].to_dict()
-                    log_audit(st.session_state.user, "update", int(idx_num), {"before": before, "after": after})
-                    st.success("Actualizado ✅")
-
-        st.markdown("---")
-        st.subheader("Bitácora")
-        audit = load_parquet(AUDIT_FILE)
-        if audit.empty:
-            st.caption("Sin eventos aún.")
-        else:
-            st.dataframe(audit.sort_values(by="ts", ascending=False).head(300),
-                         use_container_width=True, hide_index=True)
-
-# =========================
-# 🛠️ Admin
-# =========================
-with tabs[4]:
-    if st.session_state.role!="Admin":
-        st.info("Solo Admin puede administrar.")
-    else:
-        st.subheader("Catálogo de Empleados por Departamento")
-        emp_cat = load_emp_catalog()
-        cA, cB = st.columns([1,2])
-        with cA:
-            dep_new = st.selectbox("Departamento", DEPT_OPTIONS, index=0, key="dep_new")
-            emp_new = st.text_input("➕ Empleado nuevo")
-            if st.button("Guardar empleado"):
-                if emp_new.strip():
-                    add_emp_to_catalog(dep_new, emp_new.strip())
-                    st.success("Empleado agregado al catálogo"); st.rerun()
-        with cB:
-            st.dataframe(emp_cat, use_container_width=True, hide_index=True)
-        st.download_button("⬇️ Descargar cat_empleados.csv",
-                           data=emp_cat.to_csv(index=False).encode("utf-8"),
-                           file_name="cat_empleados.csv", mime="text/csv")
-        up_emp = st.file_uploader("Subir cat_empleados.csv", type=["csv"])
-        if up_emp is not None:
-            try:
-                dfu = pd.read_csv(up_emp, dtype=str)
-                if {"departamento","empleado"}.issubset(dfu.columns):
-                    save_emp_catalog(dfu)
-                    st.success("Catálogo de empleados actualizado"); st.rerun()
-                else:
-                    st.error("El CSV debe tener columnas: departamento, empleado")
-            except Exception as e:
-                st.error(f"CSV inválido: {e}")
-
-        st.markdown("---")
-        st.subheader("Catálogo de Modelos (global)")
-        mod_cat_list = load_model_catalog()
-        st.dataframe(pd.DataFrame({"modelo": mod_cat_list}), use_container_width=True, hide_index=True)
-        nuevo_mod = st.text_input("➕ Modelo nuevo")
-        if st.button("Guardar modelo"):
-            save_model_catalog(list(set(mod_cat_list + ([nuevo_mod] if nuevo_mod.strip() else []))))
-            st.success("Modelo agregado"); st.rerun()
-        st.download_button("⬇️ Descargar cat_modelos.csv",
-                           data=pd.DataFrame({"modelo": load_model_catalog()}).to_csv(index=False).encode("utf-8"),
-                           file_name="cat_modelos.csv", mime="text/csv")
-        up_mod = st.file_uploader("Subir cat_modelos.csv", type=["csv"], key="up_mod")
-        if up_mod is not None:
-            try:
-                dfm = pd.read_csv(up_mod, dtype=str)
-                if "modelo" in dfm.columns:
-                    save_model_catalog(dfm["modelo"].dropna().astype(str).tolist())
-                    st.success("Catálogo de modelos actualizado"); st.rerun()
-                else:
-                    st.error("El CSV debe tener columna: modelo")
-            except Exception as e:
-                st.error(f"CSV inválido: {e}")
-
-st.caption("© 2025 · Destajo móvil con roles, auditoría y repositorio de plantillas por departamento (con miniaturas).")
+                minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0
