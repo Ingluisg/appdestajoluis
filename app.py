@@ -533,7 +533,7 @@ tabs = st.tabs([
 ])
 
 # =========================
-# 📲 Captura
+# 📲 Captura  (CORREGIDO: Empleado depende de Depto en tiempo real)
 # =========================
 with tabs[0]:
     st.subheader("Captura móvil")
@@ -544,96 +544,120 @@ with tabs[0]:
     else:
         dept_options = DEPT_FALLBACK
 
+    # Departamento FUERA del form para refrescar empleados al cambiar
+    if "__last_depto" not in st.session_state:
+        st.session_state["__last_depto"] = None
+
+    depto = st.selectbox(
+        "Departamento*",
+        options=dept_options,
+        index=0 if st.session_state["__last_depto"] is None else (
+            dept_options.index(st.session_state["__last_depto"]) if st.session_state["__last_depto"] in dept_options else 0
+        ),
+        key="cap_depto",
+        help="Al cambiar, se actualizará el catálogo de empleados."
+    )
+
+    # Si cambió el depto, limpiamos selección de empleado
+    if st.session_state["__last_depto"] != depto:
+        for k in ["cap_emp_choice"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.session_state["__last_depto"] = depto
+
+    # opciones dependientes del depto seleccionado
+    empleados_opts = emp_options_for(depto)
+    modelos_opts = load_model_catalog()
+
     with st.form("form_captura", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
-            depto = st.selectbox("Departamento*", options=dept_options, index=0)
-            empleados_opts = emp_options_for(depto)
-            emp_choice = st.selectbox("Empleado*", ["— Selecciona —"] + empleados_opts)
+            emp_choice = st.selectbox("Empleado*", ["— Selecciona —"] + empleados_opts, key="cap_emp_choice")
         with c2:
-            modelos_opts = load_model_catalog()
-            modelo_choice = st.selectbox("Modelo*", ["— Selecciona —"] + modelos_opts)
-            produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1)
-            minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0)
+            modelo_choice = st.selectbox("Modelo*", ["— Selecciona —"] + modelos_opts, key="cap_modelo_choice")
+            produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1, key="cap_produce")
+            minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0, key="cap_min_std")
 
         if st.form_submit_button("➕ Agregar registro", use_container_width=True):
             empleado = emp_choice if emp_choice != "— Selecciona —" else ""
             modelo = modelo_choice if modelo_choice != "— Selecciona —" else ""
             if not empleado:
                 st.error("Selecciona un **Empleado** (agrégalo en 🛠️ Admin si no aparece).")
-            elif not modelo:
+                st.stop()
+            if not modelo:
                 st.error("Selecciona un **Modelo** (agrégalo en 🛠️ Admin si no aparece).")
-            else:
-                ahora = datetime.now()
-                db = load_parquet(DB_FILE)
+                st.stop()
 
-                # --- Cerrar trabajo abierto del mismo empleado (Inicio==Fin)
-                if not db.empty and {"EMPLEADO", "Inicio", "Fin"}.issubset(db.columns):
-                    try:
-                        db["Inicio"] = pd.to_datetime(db["Inicio"], errors="coerce")
-                        db["Fin"] = pd.to_datetime(db["Fin"], errors="coerce")
-                    except Exception:
-                        pass
+            ahora = datetime.now()
+            db = load_parquet(DB_FILE)
 
-                    abiertos = db[
-                        (db["EMPLEADO"].astype(str) == str(empleado)) &
-                        db["Inicio"].notna() & db["Fin"].notna() &
-                        (db["Inicio"] == db["Fin"])
-                    ]
+            # Cerrar trabajo abierto del mismo empleado (Inicio==Fin)
+            if not db.empty and {"EMPLEADO", "Inicio", "Fin"}.issubset(db.columns):
+                try:
+                    db["Inicio"] = pd.to_datetime(db["Inicio"], errors="coerce")
+                    db["Fin"] = pd.to_datetime(db["Fin"], errors="coerce")
+                except Exception:
+                    pass
 
-                    if not abiertos.empty:
-                        idx_last = abiertos.index[-1]
-                        ini_prev = pd.to_datetime(db.at[idx_last, "Inicio"])
-                        fin_prev = ahora
+                abiertos = db[
+                    (db["EMPLEADO"].astype(str) == str(empleado)) &
+                    db["Inicio"].notna() & db["Fin"].notna() &
+                    (db["Inicio"] == db["Fin"])
+                ]
 
-                        minutos_ef = working_minutes_between(ini_prev, fin_prev)
-                        produce_prev = num(db.at[idx_last, "Produce"] if "Produce" in db.columns else 0.0)
-                        min_std_prev = num(db.at[idx_last, "Minutos_Std"] if "Minutos_Std" in db.columns else 0.0)
+                if not abiertos.empty:
+                    idx_last = abiertos.index[-1]
+                    ini_prev = pd.to_datetime(db.at[idx_last, "Inicio"])
+                    fin_prev = ahora
 
-                        db.at[idx_last, "Fin"] = fin_prev
-                        db.at[idx_last, "Minutos_Proceso"] = minutos_ef
+                    minutos_ef = working_minutes_between(ini_prev, fin_prev)
+                    produce_prev = num(db.at[idx_last, "Produce"] if "Produce" in db.columns else 0.0)
+                    min_std_prev = num(db.at[idx_last, "Minutos_Std"] if "Minutos_Std" in db.columns else 0.0)
 
-                        pago, esquema, tarifa = calc_pago_row(
-                            str(db.at[idx_last, "DEPTO"]).strip().upper(),
-                            produce_prev,
-                            minutos_ef,
-                            min_std_prev,
-                            rates
-                        )
-                        db.at[idx_last, "Pago"] = pago
-                        db.at[idx_last, "Esquema_Pago"] = esquema
-                        db.at[idx_last, "Tarifa_Base"] = tarifa
-                        db.at[idx_last, "Estimado"] = False
+                    db.at[idx_last, "Fin"] = fin_prev
+                    db.at[idx_last, "Minutos_Proceso"] = minutos_ef
 
-                        save_parquet(db, DB_FILE)
-                        log_audit(
-                            st.session_state.user, "auto-close", int(idx_last),
-                            {"empleado": empleado, "cerrado": fin_prev, "minutos_efectivos": minutos_ef, "pago": pago}
-                        )
+                    pago, esquema, tarifa = calc_pago_row(
+                        str(db.at[idx_last, "DEPTO"]).strip().upper(),
+                        produce_prev,
+                        minutos_ef,
+                        min_std_prev,
+                        rates
+                    )
+                    db.at[idx_last, "Pago"] = pago
+                    db.at[idx_last, "Esquema_Pago"] = esquema
+                    db.at[idx_last, "Tarifa_Base"] = tarifa
+                    db.at[idx_last, "Estimado"] = False
 
-                # --- Nuevo registro "abierto"
-                row = {
-                    "DEPTO": norm_depto(depto),
-                    "EMPLEADO": empleado,
-                    "MODELO": modelo,
-                    "Produce": produce,
-                    "Inicio": ahora,
-                    "Fin": ahora,            # abierto (se cerrará con la siguiente asignación)
-                    "Minutos_Proceso": 0.0,  # se calcula al cerrar
-                    "Minutos_Std": minutos_std,
-                    "Semana": week_number(ahora),
-                    "Usuario": st.session_state.user,
-                    "Estimado": True,
-                    "Pago": 0.0,
-                    "Esquema_Pago": "",
-                    "Tarifa_Base": 0.0,
-                }
+                    save_parquet(db, DB_FILE)
+                    log_audit(
+                        st.session_state.user, "auto-close", int(idx_last),
+                        {"empleado": empleado, "cerrado": fin_prev, "minutos_efectivos": minutos_ef, "pago": pago}
+                    )
 
-                db = load_parquet(DB_FILE)
-                db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
-                save_parquet(db, DB_FILE)
-                log_audit(st.session_state.user, "create", int(len(db) - 1), {"via": "ui", "row": row})
-                st.success("Registro guardado ✅ (si había uno abierto, se cerró con minutos efectivos y pago).")
+            # Nuevo registro "abierto"
+            row = {
+                "DEPTO": norm_depto(depto),
+                "EMPLEADO": empleado,
+                "MODELO": modelo,
+                "Produce": produce,
+                "Inicio": ahora,
+                "Fin": ahora,            # abierto (se cerrará con la siguiente asignación)
+                "Minutos_Proceso": 0.0,  # se calcula al cerrar
+                "Minutos_Std": minutos_std,
+                "Semana": week_number(ahora),
+                "Usuario": st.session_state.user,
+                "Estimado": True,
+                "Pago": 0.0,
+                "Esquema_Pago": "",
+                "Tarifa_Base": 0.0,
+            }
+
+            db = load_parquet(DB_FILE)
+            db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
+            save_parquet(db, DB_FILE)
+            log_audit(st.session_state.user, "create", int(len(db) - 1), {"via": "ui", "row": row})
+            st.success("Registro guardado ✅ (si había uno abierto, se cerró con minutos efectivos y pago).")
 
 # =========================
 # 📈 Tablero (con cálculo en vivo, diarios/semanales y export)
@@ -833,18 +857,18 @@ with tabs[3]:
                 db.at[int(idx_num), "EMPLEADO"] = empleado
                 db.at[int(idx_num), "MODELO"] = modelo
                 db.at[int(idx_num), "Produce"] = num(produce)
-                db.at[int(idx_num), "Minutos_Std"] = num(min_std)
+                db.at[int[idx_num), "Minutos_Std"] = num(min_std)
                 if st.session_state.role == "Admin":
-                    db.at[int(idx_num), "Inicio"] = inicio
-                    db.at[int(idx_num), "Fin"] = fin
+                    db.at[int[idx_num), "Inicio"] = inicio
+                    db.at[int[idx_num), "Fin"] = fin
                     minutos_ef = working_minutes_between(inicio, fin)
-                    db.at[int(idx_num), "Minutos_Proceso"] = minutos_ef
+                    db.at[int[idx_num), "Minutos_Proceso"] = minutos_ef
                     pago, esquema, tarifa = calc_pago_row(
                         norm_depto(depto), num(produce), minutos_ef, num(min_std), rates
                     )
-                    db.at[int(idx_num), "Pago"] = pago
-                    db.at[int(idx_num), "Esquema_Pago"] = esquema
-                    db.at[int(idx_num), "Tarifa_Base"] = tarifa
+                    db.at[int[idx_num), "Pago"] = pago
+                    db.at[int[idx_num), "Esquema_Pago"] = esquema
+                    db.at[int[idx_num), "Tarifa_Base"] = tarifa
                 save_parquet(db, DB_FILE)
                 after = db.iloc[int(idx_num)].to_dict()
                 log_audit(st.session_state.user, "update", int(idx_num), {"before": before, "after": after})
