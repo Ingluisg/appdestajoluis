@@ -1,4 +1,4 @@
-# app.py — Destajo con Horarios, Tarifas desde Excel, Catálogos por Depto, PDFs, Tablero y Nómina
+# app.py — Destajo con Horarios, Tarifas desde Excel, Catálogos, PDFs, Tablero y Nómina (día/semana)
 # © 2025
 
 import os, json, base64, re, hashlib, math, io
@@ -39,7 +39,8 @@ THUMBS_DIR = os.path.join(DOCS_DIR, "thumbs")
 os.makedirs(DOCS_DIR, exist_ok=True)
 os.makedirs(THUMBS_DIR, exist_ok=True)
 
-DEPT_OPTIONS = ["COSTURA", "TAPIZ", "CARPINTERIA", "COJINERIA", "CORTE", "ARMADO", "HILADO", "COLCHONETA", "OTRO"]
+# fallback por si aún no hay tarifas
+DEPT_FALLBACK = ["COSTURA", "TAPIZ", "CARPINTERIA", "COJINERIA", "CORTE", "ARMADO", "HILADO", "COLCHONETA", "RESORTE", "OTRO"]
 
 # =========================
 # Utils
@@ -81,6 +82,9 @@ def num(val, default=0.0):
         return x
     except Exception:
         return default
+
+def norm_depto(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s).upper().strip())
 
 # =========================
 # Horario laboral (minutos efectivos)
@@ -156,7 +160,7 @@ def normalize_rates(df_in: pd.DataFrame) -> pd.DataFrame:
     if dep_col is None:
         return pd.DataFrame(columns=cols_out)
 
-    out = pd.DataFrame({"DEPTO": df[dep_col].astype(str).str.strip().str.upper()})
+    out = pd.DataFrame({"DEPTO": df[dep_col].astype(str).map(norm_depto)})
 
     c_hr = find_col(df, ["$/hr", "precio_hora", "por_hora", "x_hora", "hora"])
     c_week = find_col(df, ["sem", "semana", "semanal", "$ semana", "$/sem"])
@@ -196,6 +200,7 @@ def load_rates_csv() -> pd.DataFrame:
             for c in ["DEPTO", "precio_minuto", "precio_pieza", "precio_hora"]:
                 if c not in df.columns:
                     return pd.DataFrame(columns=["DEPTO", "precio_minuto", "precio_pieza", "precio_hora"])
+            df["DEPTO"] = df["DEPTO"].map(norm_depto)
             return df
         except Exception:
             pass
@@ -207,7 +212,7 @@ def save_rates_csv(df_rates: pd.DataFrame):
 
 def calc_pago_row(depto: str, produce: float, minutos_ef: float, minutos_std: float, rates: pd.DataFrame) -> Tuple[float, str, float]:
     """Devuelve (pago, esquema, tarifa_base) con prioridad: minuto → pieza → hora."""
-    dep = (depto or "").strip().upper()
+    dep = norm_depto(depto)
     r = rates[rates["DEPTO"] == dep]
     tarifa_min = float(r["precio_minuto"].iloc[0]) if not r.empty and pd.notna(r["precio_minuto"].iloc[0]) else math.nan
     tarifa_pza = float(r["precio_pieza"].iloc[0]) if not r.empty and pd.notna(r["precio_pieza"].iloc[0]) else math.nan
@@ -287,7 +292,7 @@ def load_emp_catalog() -> pd.DataFrame:
             df.columns = [c.strip().lower() for c in df.columns]
             if not {"departamento","empleado"}.issubset(df.columns):
                 return pd.DataFrame(columns=["departamento","empleado"])
-            df["departamento"] = df["departamento"].astype(str).str.strip().str.upper()
+            df["departamento"] = df["departamento"].map(norm_depto)
             df["empleado"] = df["empleado"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
             df = df[(df["departamento"]!="") & (df["empleado"]!="")]
             df = df.drop_duplicates(subset=["departamento","empleado"], keep="first")
@@ -307,7 +312,7 @@ def save_emp_catalog(df: pd.DataFrame):
     df = df.fillna("")
     df.columns = [c.strip().lower() for c in df.columns]
     if "departamento" in df.columns:
-        df["departamento"] = df["departamento"].astype(str).str.strip().str.upper()
+        df["departamento"] = df["departamento"].map(norm_depto)
     if "empleado" in df.columns:
         df["empleado"] = df["empleado"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     df = df[(df["departamento"]!="") & (df["empleado"]!="")]
@@ -315,7 +320,7 @@ def save_emp_catalog(df: pd.DataFrame):
     df.to_csv(CAT_EMP, index=False)
 
 def emp_options_for(depto: str) -> List[str]:
-    dep = str(depto).upper()
+    dep = norm_depto(depto)
     cat = load_emp_catalog()
     return cat.loc[cat["departamento"]==dep, "empleado"].astype(str).tolist()
 
@@ -423,19 +428,28 @@ def show_pdf_file(path: str, height: int = 680):
 # Derivados en vivo (minutos/pago) y export Nómina
 # =========================
 def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFrame:
-    """Agrega columnas derivadas: Minutos_Calc, Pago_Calc, Esquema_Calc, Tarifa_Calc.
+    """Agrega columnas derivadas: Minutos_Calc (en vivo: si Inicio==Fin, usa ahora), Pago_Calc, Esquema_Calc, Tarifa_Calc.
        Si Minutos_Proceso/Pago están vacíos o 0, muestra los calculados."""
     if df.empty:
         return df
     d = df.copy()
+
+    # Normalización de columnas base
+    if "DEPTO" in d.columns:
+        d["DEPTO"] = d["DEPTO"].map(norm_depto)
     if "Inicio" in d.columns:
         d["Inicio"] = pd.to_datetime(d["Inicio"], errors="coerce")
     if "Fin" in d.columns:
         d["Fin"] = pd.to_datetime(d["Fin"], errors="coerce")
 
+    now = datetime.now()
+
     def mins_row(r):
         ini, fin = r.get("Inicio"), r.get("Fin")
-        if pd.notna(ini) and pd.notna(fin) and ini != fin:
+        # "Abierto": Inicio==Fin o Fin nulo → tomar ahora como Fin para mostrar avance
+        if pd.notna(ini) and (pd.isna(fin) or ini == fin):
+            return working_minutes_between(ini, now)
+        if pd.notna(ini) and pd.notna(fin):
             return working_minutes_between(ini, fin)
         return float(r.get("Minutos_Proceso", 0) or 0)
 
@@ -467,26 +481,44 @@ def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFra
 
     d["Minutos_Proceso"] = d["Minutos_Proceso"].round(2)
     d["Pago"] = d["Pago"].round(2)
+
+    # auxiliares para agrupaciones
+    if "Inicio" in d.columns:
+        d["Fecha"] = d["Inicio"].dt.date
+    if "Semana" not in d.columns and "Inicio" in d.columns:
+        d["Semana"] = d["Inicio"].dt.isocalendar().week
+
     return d
 
 def export_nomina(df: pd.DataFrame) -> bytes:
     """Genera un XLSX con:
        - Detalle por registro
+       - Totales por empleado/fecha (día)
        - Totales por empleado/semana
     """
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as xw:
         # Detalle
-        detalle_cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana"] if c in df.columns]
+        detalle_cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana","Fecha"] if c in df.columns]
         df[detalle_cols].to_excel(xw, index=False, sheet_name="Detalle")
-        # Totales
-        if {"EMPLEADO","Semana","Pago","Minutos_Proceso"}.issubset(df.columns):
-            agg = (df.groupby(["EMPLEADO","Semana"], dropna=False)
+
+        # Día
+        if {"EMPLEADO","Fecha","Pago","Minutos_Proceso"}.issubset(df.columns):
+            dia = (df.groupby(["EMPLEADO","Fecha"], dropna=False)
                      .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
                      .reset_index())
-            agg["Horas"] = (agg["Minutos"] / 60).round(2)
-            agg["Pagos"] = agg["Pagos"].round(2)
-            agg.to_excel(xw, index=False, sheet_name="Nomina")
+            dia["Horas"] = (dia["Minutos"] / 60).round(2)
+            dia["Pagos"] = dia["Pagos"].round(2)
+            dia.to_excel(xw, index=False, sheet_name="Nomina_Diaria")
+
+        # Semana
+        if {"EMPLEADO","Semana","Pago","Minutos_Proceso"}.issubset(df.columns):
+            sem = (df.groupby(["EMPLEADO","Semana"], dropna=False)
+                     .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
+                     .reset_index())
+            sem["Horas"] = (sem["Minutos"] / 60).round(2)
+            sem["Pagos"] = sem["Pagos"].round(2)
+            sem.to_excel(xw, index=False, sheet_name="Nomina_Semanal")
     return output.getvalue()
 
 # =========================
@@ -506,11 +538,16 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Captura móvil")
     rates = load_rates_csv()
+    # departamentos dinámicos desde tarifas (si no hay, usar fallback)
+    if not rates.empty:
+        dept_options = sorted(list(set(DEPT_FALLBACK) | set(rates["DEPTO"].dropna().astype(str).tolist())))
+    else:
+        dept_options = DEPT_FALLBACK
 
     with st.form("form_captura", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
-            depto = st.selectbox("Departamento*", options=DEPT_OPTIONS, index=0)
+            depto = st.selectbox("Departamento*", options=dept_options, index=0)
             empleados_opts = emp_options_for(depto)
             emp_choice = st.selectbox("Empleado*", ["— Selecciona —"] + empleados_opts)
         with c2:
@@ -576,7 +613,7 @@ with tabs[0]:
 
                 # --- Nuevo registro "abierto"
                 row = {
-                    "DEPTO": str(depto).strip().upper(),
+                    "DEPTO": norm_depto(depto),
                     "EMPLEADO": empleado,
                     "MODELO": modelo,
                     "Produce": produce,
@@ -599,7 +636,7 @@ with tabs[0]:
                 st.success("Registro guardado ✅ (si había uno abierto, se cerró con minutos efectivos y pago).")
 
 # =========================
-# 📈 Tablero (con cálculo en vivo y export)
+# 📈 Tablero (con cálculo en vivo, diarios/semanales y export)
 # =========================
 with tabs[1]:
     st.subheader("Producción en vivo")
@@ -609,6 +646,12 @@ with tabs[1]:
         st.info("Sin registros.")
     else:
         show = compute_minutes_and_pay(base, rates)
+
+        # Avisar si hay deptos sin tarifa
+        if not rates.empty and "DEPTO" in show.columns:
+            sin_tarifa = sorted(set(show["DEPTO"].dropna()) - set(rates["DEPTO"].dropna()))
+            if sin_tarifa:
+                st.warning("Áreas sin tarifa en rates.csv: " + ", ".join(sin_tarifa))
 
         c1, c2, c3 = st.columns(3)
         f_depto = c1.multiselect("Departamento", sorted(show["DEPTO"].dropna().astype(str).unique().tolist()) if "DEPTO" in show.columns else [])
@@ -624,18 +667,29 @@ with tabs[1]:
             if f_emp:
                 fdf = fdf[fdf["EMPLEADO"].astype(str).str.contains(f_emp, case=False, na=False)]
 
-        cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana"] if c in fdf.columns]
+        cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana","Fecha"] if c in fdf.columns]
         st.dataframe(fdf.sort_values(by="Inicio", ascending=False)[cols],
                      use_container_width=True, hide_index=True)
 
-        st.markdown("**Totales por empleado y semana**")
-        if {"EMPLEADO","Semana","Pago","Minutos_Proceso"}.issubset(fdf.columns):
-            agg = (fdf.groupby(["EMPLEADO","Semana"], dropna=False)
+        # Totales por día (empleado/fecha)
+        st.markdown("### Pagos por día")
+        if {"EMPLEADO","Fecha","Pago","Minutos_Proceso"}.issubset(fdf.columns):
+            dia = (fdf.groupby(["EMPLEADO","Fecha"], dropna=False)
                      .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
                      .reset_index())
-            agg["Horas"] = (agg["Minutos"] / 60).round(2)
-            agg["Pagos"] = agg["Pagos"].round(2)
-            st.dataframe(agg.sort_values(["Semana","EMPLEADO"]), use_container_width=True, hide_index=True)
+            dia["Horas"] = (dia["Minutos"] / 60).round(2)
+            dia["Pagos"] = dia["Pagos"].round(2)
+            st.dataframe(dia.sort_values(["Fecha","EMPLEADO"]), use_container_width=True, hide_index=True)
+
+        # Totales por semana (empleado/semana)
+        st.markdown("### Pagos por semana")
+        if {"EMPLEADO","Semana","Pago","Minutos_Proceso"}.issubset(fdf.columns):
+            sem = (fdf.groupby(["EMPLEADO","Semana"], dropna=False)
+                     .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
+                     .reset_index())
+            sem["Horas"] = (sem["Minutos"] / 60).round(2)
+            sem["Pagos"] = sem["Pagos"].round(2)
+            st.dataframe(sem.sort_values(["Semana","EMPLEADO"]), use_container_width=True, hide_index=True)
 
             # Exportar nómina
             xls = export_nomina(fdf)
@@ -655,7 +709,7 @@ with tabs[2]:
 
     if st.session_state.role == "Admin":
         with st.expander("⬆️ Subir nuevo PDF", expanded=False):
-            up_depto = st.selectbox("Departamento", DEPT_OPTIONS, key="up_depto")
+            up_depto = st.selectbox("Departamento", sorted(list(set(DEPT_FALLBACK) | set(load_rates_csv()["DEPTO"].dropna().astype(str).tolist()))))
             up_title = st.text_input("Título o descripción")
             up_tags = st.text_input("Etiquetas (separadas por comas)", placeholder="corte, guía, plantilla A")
             up_file = st.file_uploader("Archivo PDF", type=["pdf"])
@@ -674,7 +728,7 @@ with tabs[2]:
                     idx = load_docs_index()
                     new_id = str(int(idx["id"].max()) + 1) if not idx.empty else "1"
                     row = {"id": new_id,
-                           "departamento": str(up_depto).strip().upper(),
+                           "departamento": norm_depto(up_depto),
                            "titulo": (up_title.strip() if up_title else safe_name),
                            "tags": up_tags.strip(),
                            "filename": safe_name,
@@ -691,12 +745,12 @@ with tabs[2]:
         st.info("Aún no hay documentos. (Admin puede subirlos arriba)")
     else:
         c1, c2 = st.columns([1, 2])
-        dept_filter = c1.multiselect("Departamento", DEPT_OPTIONS)
+        dept_filter = c1.multiselect("Departamento", sorted(list(set(DEPT_FALLBACK) | set(load_rates_csv()["DEPTO"].dropna().astype(str).tolist()))))
         q = c2.text_input("Buscar (título / tags / archivo)", placeholder="ej. corte, plantilla, tapiz...")
 
         df = idx.copy()
         if dept_filter:
-            df = df[df["departamento"].isin([d.upper() for d in dept_filter])]
+            df = df[df["departamento"].isin([norm_depto(d) for d in dept_filter])]
         if q.strip():
             qq = q.strip().lower()
             df = df[df.apply(lambda r: any(qq in str(r[col]).lower() for col in ["titulo", "tags", "filename"]), axis=1)]
@@ -751,9 +805,8 @@ with tabs[3]:
         with st.form("edit_form"):
             c1, c2 = st.columns(2)
             with c1:
-                depto = st.selectbox("Departamento", options=DEPT_OPTIONS,
-                                     index=max(0, DEPT_OPTIONS.index(str(row.get("DEPTO", "OTRO")).upper()))
-                                     if str(row.get("DEPTO", "")).upper() in DEPT_OPTIONS else 0)
+                depto = st.selectbox("Departamento", options=sorted(list(set(DEPT_FALLBACK) | set(rates["DEPTO"].dropna().astype(str).tolist()))) or DEPT_FALLBACK,
+                                     index=0)
                 empleado = st.text_input("Empleado", value=str(row.get("EMPLEADO", "")))
                 modelo = st.text_input("Modelo", value=str(row.get("MODELO", "")))
                 produce = st.number_input("Produce", value=int(num(row.get("Produce"), 0)), min_value=0)
@@ -776,7 +829,7 @@ with tabs[3]:
             submitted = st.form_submit_button("💾 Guardar cambios")
             if submitted:
                 before = db.iloc[int(idx_num)].to_dict()
-                db.at[int(idx_num), "DEPTO"] = str(depto).strip().upper()
+                db.at[int(idx_num), "DEPTO"] = norm_depto(depto)
                 db.at[int(idx_num), "EMPLEADO"] = empleado
                 db.at[int(idx_num), "MODELO"] = modelo
                 db.at[int(idx_num), "Produce"] = num(produce)
@@ -787,7 +840,7 @@ with tabs[3]:
                     minutos_ef = working_minutes_between(inicio, fin)
                     db.at[int(idx_num), "Minutos_Proceso"] = minutos_ef
                     pago, esquema, tarifa = calc_pago_row(
-                        str(depto).strip().upper(), num(produce), minutos_ef, num(min_std), rates
+                        norm_depto(depto), num(produce), minutos_ef, num(min_std), rates
                     )
                     db.at[int(idx_num), "Pago"] = pago
                     db.at[int(idx_num), "Esquema_Pago"] = esquema
@@ -817,7 +870,7 @@ with tabs[4]:
         emp_cat = load_emp_catalog()
         cA, cB = st.columns([1, 2])
         with cA:
-            dep_new = st.selectbox("Departamento", DEPT_OPTIONS, index=0, key="dep_new")
+            dep_new = st.selectbox("Departamento", sorted(list(set(DEPT_FALLBACK) | set(load_rates_csv()["DEPTO"].dropna().astype(str).tolist()))), index=0, key="dep_new")
             emp_new = st.text_input("➕ Empleado nuevo")
             if st.button("Guardar empleado"):
                 merged = pd.concat([emp_cat, pd.DataFrame([{"departamento": dep_new, "empleado": emp_new}])], ignore_index=True)
@@ -891,4 +944,4 @@ with tabs[4]:
                 except Exception as e:
                     st.error(f"No pude leer el Excel: {e}")
 
-st.caption("© 2025 · Destajo móvil con horarios, tarifas por área, catálogos, visor de PDFs, tablero y nómina.")
+st.caption("© 2025 · Destajo móvil con horarios, tarifas por área, catálogos, visor de PDFs, tablero y nómina (día/semana).")
