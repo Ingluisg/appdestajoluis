@@ -669,13 +669,13 @@ with tabs[3]:
                     db.at[int(idx_num), "Inicio"] = inicio
                     db.at[int(idx_num), "Fin"] = fin
                     minutos_ef = working_minutes_between(inicio, fin)
-                    db.at[int(idx_num), "Minutos_Proceso"] = minutos_ef
-                    pago, esquema, tarifa = calc_pago_row(
-                        str(depto).strip().upper(), num(produce), minutos_ef, num(min_std), rates
-                    )
-                    db.at[int(idx_num), "Pago"] = pago
-                    db.at[int(idx_num), "Esquema_Pago"] = esquema
-                    db.at[int[idx_num), "Tarifa_Base"] = tarifa
+db.at[int(idx_num), "Minutos_Proceso"] = minutos_ef
+pago, esquema, tarifa = calc_pago_row(
+    str(depto).strip().upper(), num(produce), minutos_ef, num(min_std), rates
+)
+db.at[int(idx_num), "Pago"] = pago
+db.at[int(idx_num), "Esquema_Pago"] = esquema
+db.at[int(idx_num), "Tarifa_Base"] = tarifa   # <- AQUÍ estaba el typo
                 save_parquet(db, DB_FILE)
                 after = db.iloc[int(idx_num)].to_dict()
                 log_audit(st.session_state.user, "update", int(idx_num), {"before": before, "after": after})
