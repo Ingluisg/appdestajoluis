@@ -535,6 +535,12 @@ tabs = st.tabs([
 # =========================
 # 📲 Captura  (CORREGIDO: Empleado depende de Depto en tiempo real)
 # =========================
+PLACEHOLDER_EMP = "— Selecciona —"
+
+def _reset_emp_on_depto_change():
+    # Al cambiar el depto, reiniciar la selección del empleado para forzar lista limpia
+    st.session_state["cap_emp_choice"] = PLACEHOLDER_EMP
+
 with tabs[0]:
     st.subheader("Captura móvil")
     rates = load_rates_csv()
@@ -544,43 +550,42 @@ with tabs[0]:
     else:
         dept_options = DEPT_FALLBACK
 
-    # Departamento FUERA del form para refrescar empleados al cambiar
-    if "__last_depto" not in st.session_state:
-        st.session_state["__last_depto"] = None
-
+    # Departamento FUERA del form, con on_change que reinicia empleado
     depto = st.selectbox(
         "Departamento*",
         options=dept_options,
-        index=0 if st.session_state["__last_depto"] is None else (
-            dept_options.index(st.session_state["__last_depto"]) if st.session_state["__last_depto"] in dept_options else 0
-        ),
+        index=0 if "cap_depto" not in st.session_state or st.session_state.get("cap_depto") not in dept_options
+              else dept_options.index(st.session_state.get("cap_depto")),
         key="cap_depto",
-        help="Al cambiar, se actualizará el catálogo de empleados."
+        on_change=_reset_emp_on_depto_change,
+        help="Al cambiar, se reinicia y recarga el catálogo de empleados."
     )
-
-    # Si cambió el depto, limpiamos selección de empleado
-    if st.session_state["__last_depto"] != depto:
-        for k in ["cap_emp_choice"]:
-            if k in st.session_state:
-                del st.session_state[k]
-        st.session_state["__last_depto"] = depto
 
     # opciones dependientes del depto seleccionado
     empleados_opts = emp_options_for(depto)
     modelos_opts = load_model_catalog()
 
+    # Asegurar valor por defecto coherente con la lista actual
+    if st.session_state.get("cap_emp_choice") not in ([PLACEHOLDER_EMP] + empleados_opts):
+        st.session_state["cap_emp_choice"] = PLACEHOLDER_EMP
+
     with st.form("form_captura", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
-            emp_choice = st.selectbox("Empleado*", ["— Selecciona —"] + empleados_opts, key="cap_emp_choice")
+            emp_choice = st.selectbox(
+                "Empleado*",
+                [PLACEHOLDER_EMP] + empleados_opts,
+                key="cap_emp_choice",
+                help="Catálogo dependiente del departamento seleccionado."
+            )
         with c2:
-            modelo_choice = st.selectbox("Modelo*", ["— Selecciona —"] + modelos_opts, key="cap_modelo_choice")
+            modelo_choice = st.selectbox("Modelo*", [PLACEHOLDER_EMP] + modelos_opts, key="cap_modelo_choice")
             produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1, key="cap_produce")
             minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0, key="cap_min_std")
 
         if st.form_submit_button("➕ Agregar registro", use_container_width=True):
-            empleado = emp_choice if emp_choice != "— Selecciona —" else ""
-            modelo = modelo_choice if modelo_choice != "— Selecciona —" else ""
+            empleado = emp_choice if emp_choice != PLACEHOLDER_EMP else ""
+            modelo = modelo_choice if modelo_choice != PLACEHOLDER_EMP else ""
             if not empleado:
                 st.error("Selecciona un **Empleado** (agrégalo en 🛠️ Admin si no aparece).")
                 st.stop()
@@ -855,8 +860,8 @@ with tabs[3]:
                 before = db.iloc[int(idx_num)].to_dict()
                 db.at[int(idx_num), "DEPTO"] = norm_depto(depto)
                 db.at[int(idx_num), "EMPLEADO"] = empleado
-                db.at[int(idx_num), "MODELO"] = modelo
-                db.at[int(idx_num), "Produce"] = num(produce)
+                db.at[int[idx_num), "MODELO"] = modelo
+                db.at[int[idx_num), "Produce"] = num(produce)
                 db.at[int[idx_num), "Minutos_Std"] = num(min_std)
                 if st.session_state.role == "Admin":
                     db.at[int[idx_num), "Inicio"] = inicio
