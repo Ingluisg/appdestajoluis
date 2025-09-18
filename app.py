@@ -492,7 +492,6 @@ if not db.empty and {"EMPLEADO","Inicio","Fin"}.issubset(db.columns):
             st.session_state.user, "auto-close", int(idx_last),
             {"empleado": empleado, "cerrado": fin_prev, "minutos_efectivos": minutos_ef, "pago": pago}
         )
-                    
                 # Nuevo registro "abierto"
                 row = {
                     "DEPTO": str(depto).strip().upper(),
