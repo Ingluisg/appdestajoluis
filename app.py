@@ -1,4 +1,4 @@
-# app.py — Destajo con Horarios, Tarifas por Área (Excel), Catálogos por Depto, PDFs con miniaturas y Auditoría
+# app.py — Destajo con Horarios, Tarifas por Área (Excel), Catálogos por Depto, PDFs y Auditoría
 # © 2025
 
 import os, json, base64, re, hashlib, math
@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 # =========================
-# Configuración general
+# Configuración
 # =========================
 APP_TITLE = "Destajo · Horario + Tarifas + Plantillas"
 st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="centered")
@@ -27,11 +27,11 @@ CAT_EMP = os.path.join(DATA_DIR, "cat_empleados.csv")   # columnas: departamento
 CAT_MOD = os.path.join(DATA_DIR, "cat_modelos.csv")     # columna: modelo
 
 # Tarifas (área)
-RATES_CSV = os.path.join(DATA_DIR, "rates.csv")         # normalizado desde Excel
+RATES_CSV = os.path.join(DATA_DIR, "rates.csv")         # normalizado desde Excel (hoja 'tiempos')
 RATES_XLSX = os.path.join(DATA_DIR, "rates_source.xlsx")
 DEFAULT_RATE_SHEET = "tiempos"
 
-# Documentos (PDFs)
+# Documentos PDF
 DOCS_DIR = os.path.join(DATA_DIR, "docs")
 DOCS_INDEX = os.path.join(DATA_DIR, "docs_index.csv")   # id,departamento,titulo,tags,filename,relpath,uploaded_by,ts
 THUMBS_DIR = os.path.join(DOCS_DIR, "thumbs")
@@ -82,7 +82,7 @@ def num(val, default=0.0):
         return default
 
 # =========================
-# Horario laboral (cálculo de minutos efectivos)
+# Horario laboral (minutos efectivos)
 # =========================
 #  - L-V: 07:30–14:00  y 15:00–18:30  (excluye 14:00–15:00 comida)
 #  - Sáb: 07:30–13:30
@@ -120,7 +120,7 @@ def working_minutes_between(start: datetime, end: datetime) -> float:
     return round(total, 2)
 
 # =========================
-# Tarifas por área (desde Excel -> CSV normalizado)
+# Tarifas por área (Excel -> CSV normalizado)
 # =========================
 def normalize_rates(df_in: pd.DataFrame) -> pd.DataFrame:
     if df_in is None or df_in.empty:
@@ -134,15 +134,15 @@ def normalize_rates(df_in: pd.DataFrame) -> pd.DataFrame:
             dep_col = c
             break
     if dep_col is None:
-        dep_candidates = [c for c in df.columns if "dept" in c or "area" in c or "área" in c]
-        dep_col = dep_candidates[0] if dep_candidates else None
+        cand = [c for c in df.columns if "dept" in c or "area" in c or "área" in c]
+        dep_col = cand[0] if cand else None
     if dep_col is None:
         return pd.DataFrame(columns=["DEPTO", "precio_minuto", "precio_pieza", "precio_hora"])
 
     out = pd.DataFrame({"DEPTO": df[dep_col].astype(str).str.strip().str.upper()})
 
-    def find_col(keyword_list: List[str]) -> Optional[str]:
-        for key in keyword_list:
+    def find_col(keys: List[str]) -> Optional[str]:
+        for key in keys:
             for c in df.columns:
                 if key in c:
                     return c
@@ -150,7 +150,7 @@ def normalize_rates(df_in: pd.DataFrame) -> pd.DataFrame:
 
     c_min = find_col(["precio_minuto", "minuto", "x_min", "por_min"])
     c_pza = find_col(["precio_pieza", "pieza", "x_pieza", "por_pieza"])
-    c_hr = find_col(["precio_hora", "hora", "x_hora", "por_hora"])
+    c_hr  = find_col(["precio_hora", "hora", "x_hora", "por_hora"])
 
     for name, col in [("precio_minuto", c_min), ("precio_pieza", c_pza), ("precio_hora", c_hr)]:
         if col and col in df.columns:
@@ -185,7 +185,7 @@ def calc_pago_row(depto: str, produce: float, minutos_ef: float, minutos_std: fl
     r = rates[rates["DEPTO"] == dep]
     tarifa_min = float(r["precio_minuto"].iloc[0]) if not r.empty and pd.notna(r["precio_minuto"].iloc[0]) else math.nan
     tarifa_pza = float(r["precio_pieza"].iloc[0]) if not r.empty and pd.notna(r["precio_pieza"].iloc[0]) else math.nan
-    tarifa_hr = float(r["precio_hora"].iloc[0]) if not r.empty and pd.notna(r["precio_hora"].iloc[0]) else math.nan
+    tarifa_hr  = float(r["precio_hora"].iloc[0])  if not r.empty and pd.notna(r["precio_hora"].iloc[0])  else math.nan
 
     if not math.isnan(tarifa_min):
         return (round(minutos_ef * tarifa_min, 2), "minuto", tarifa_min)
@@ -281,7 +281,7 @@ def save_emp_catalog(df: pd.DataFrame):
     out.to_csv(CAT_EMP, index=False)
 
 def emp_options_for(depto: str) -> List[str]:
-    dep = str(depto).strip().str.upper() if hasattr(depto, "upper") else str(depto).upper()
+    dep = str(depto).upper()
     cat = load_emp_catalog()
     return sorted(cat.loc[cat["departamento"] == dep, "empleado"].dropna().astype(str).unique().tolist())
 
@@ -445,18 +445,13 @@ with tabs[0]:
                         ini_prev = pd.to_datetime(db.at[idx_last, "Inicio"])
                         fin_prev = ahora
 
-                        # minutos efectivos (respeta horario laboral y descarta comida)
                         minutos_ef = working_minutes_between(ini_prev, fin_prev)
-
-                        # valores numéricos seguros
                         produce_prev = num(db.at[idx_last, "Produce"] if "Produce" in db.columns else 0.0)
                         min_std_prev = num(db.at[idx_last, "Minutos_Std"] if "Minutos_Std" in db.columns else 0.0)
 
-                        # actualizar registro cerrado
                         db.at[idx_last, "Fin"] = fin_prev
                         db.at[idx_last, "Minutos_Proceso"] = minutos_ef
 
-                        # calcular pago según tarifas por área
                         pago, esquema, tarifa = calc_pago_row(
                             str(db.at[idx_last, "DEPTO"]).strip().upper(),
                             produce_prev,
@@ -483,7 +478,7 @@ with tabs[0]:
                     "Produce": produce,
                     "Inicio": ahora,
                     "Fin": ahora,            # abierto (se cerrará con la siguiente asignación)
-                    "Minutos_Proceso": 0.0,  # se calcula al cerrar con working_minutes_between
+                    "Minutos_Proceso": 0.0,  # se calcula al cerrar
                     "Minutos_Std": minutos_std,
                     "Semana": week_number(ahora),
                     "Usuario": st.session_state.user,
@@ -669,13 +664,13 @@ with tabs[3]:
                     db.at[int(idx_num), "Inicio"] = inicio
                     db.at[int(idx_num), "Fin"] = fin
                     minutos_ef = working_minutes_between(inicio, fin)
-db.at[int(idx_num), "Minutos_Proceso"] = minutos_ef
-pago, esquema, tarifa = calc_pago_row(
-    str(depto).strip().upper(), num(produce), minutos_ef, num(min_std), rates
-)
-db.at[int(idx_num), "Pago"] = pago
-db.at[int(idx_num), "Esquema_Pago"] = esquema
-db.at[int(idx_num), "Tarifa_Base"] = tarifa   # <- AQUÍ estaba el typo
+                    db.at[int(idx_num), "Minutos_Proceso"] = minutos_ef
+                    pago, esquema, tarifa = calc_pago_row(
+                        str(depto).strip().upper(), num(produce), minutos_ef, num(min_std), rates
+                    )
+                    db.at[int(idx_num), "Pago"] = pago
+                    db.at[int(idx_num), "Esquema_Pago"] = esquema
+                    db.at[int(idx_num), "Tarifa_Base"] = tarifa
                 save_parquet(db, DB_FILE)
                 after = db.iloc[int(idx_num)].to_dict()
                 log_audit(st.session_state.user, "update", int(idx_num), {"before": before, "after": after})
