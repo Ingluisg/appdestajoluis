@@ -410,20 +410,19 @@ tabs = st.tabs([
 # =========================
 # 📲 Captura
 # =========================
-with tabs[0]:
-    st.subheader("Captura móvil")
-    if not perms["editable"]:
-        st.info("Sin permisos para capturar.")
-    else:
-        rates = load_rates_csv()  # tarifas cargadas
-        with st.form("form_captura", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                depto = st.selectbox("Departamento*", options=DEPT_OPTIONS, index=0)
-                empleados_opts = emp_options_for(depto)
-                emp_choice = st.selectbox("Empleado*", ["— Selecciona —"] + empleados_opts)
-            with c2:
-                modelos_opts = load_model_catalog()
-                modelo_choice = st.selectbox("Modelo*", ["— Selecciona —"] + modelos_opts)
-                produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1)
-                minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0
+with st.form("form_captura", clear_on_submit=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        depto = st.selectbox("Departamento*", options=DEPT_OPTIONS, index=0)
+        empleados_opts = emp_options_for(depto)
+        emp_choice = st.selectbox("Empleado*", ["— Selecciona —"] + empleados_opts)
+    with c2:
+        modelos_opts = load_model_catalog()
+        modelo_choice = st.selectbox("Modelo*", ["— Selecciona —"] + modelos_opts)
+        produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1)
+        minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0)
+
+    if st.form_submit_button("➕ Agregar registro", use_container_width=True):
+        empleado = emp_choice if emp_choice != "— Selecciona —" else ""
+        modelo   = modelo_choice if modelo_choice != "— Selecciona —" else ""
+        # ... (resto de tu lógica de guardado)
