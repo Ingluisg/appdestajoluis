@@ -1134,4 +1134,4 @@ with tabs[4]:
                 except Exception as e:
                     st.error(f"CSV inválido: {e}")
 
-st.caption("©️ 2025 · DEPARTAMENTO DE PRODUCTIVIDAD Y EFICIENCIA OPERATIVA.")
+st.caption("©️ 2025 · DEPARTAMENTO DE PRODUCTIVIDAD Y EFICIENCIA OPERATIVA DEVANÉ.")
