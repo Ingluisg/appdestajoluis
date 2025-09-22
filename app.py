@@ -1,13 +1,14 @@
 # app.py — Destajo con Horarios, Tarifas desde Excel, Catálogos, PDFs, Tablero y Nómina (día/semana)
-# © 2025
+# ©️ 2025
 
 import os, json, base64, re, hashlib, math, io
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+from zoneinfo import ZoneInfo  # <-- TZ FIX
 
 # =========================
 # Configuración
@@ -43,10 +44,42 @@ os.makedirs(THUMBS_DIR, exist_ok=True)
 DEPT_FALLBACK = ["COSTURA", "TAPIZ", "CARPINTERIA", "COJINERIA", "CORTE", "ARMADO", "HILADO", "COLCHONETA", "RESORTE", "OTRO"]
 
 # =========================
+# TZ helpers (FIX)
+# =========================
+LOCAL_TZ = ZoneInfo("America/Mexico_City")
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def to_local(dt: datetime) -> datetime:
+    """UTC/naive → tz-aware local."""
+    if dt is None or pd.isna(dt):
+        return dt
+    if dt.tzinfo is None:
+        # asumimos que lo guardado sin tz era UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(LOCAL_TZ)
+
+def to_utc(dt: datetime) -> datetime:
+    """Naive (local) o tz-aware cualquier → tz-aware UTC."""
+    if dt is None or pd.isna(dt):
+        return dt
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=LOCAL_TZ)
+    return dt.astimezone(timezone.utc)
+
+def as_local_naive(dt: datetime) -> datetime:
+    """Devuelve datetime naive en hora local (útil para cálculos con ventanas)."""
+    if dt is None or pd.isna(dt):
+        return dt
+    return to_local(dt).replace(tzinfo=None)
+
+# =========================
 # Utils
 # =========================
 def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    # registrar en UTC (auditoría)
+    return now_utc().isoformat(timespec="seconds")
 
 def week_number(dt: Optional[datetime]):
     if pd.isna(dt) or dt is None:
@@ -108,9 +141,12 @@ def overlap_minutes(a_start: datetime, a_end: datetime, b_start: datetime, b_end
     return (end - start).total_seconds() / 60.0
 
 def working_minutes_between(start: datetime, end: datetime) -> float:
-    """Minutos dentro de ventanas laborales por día; la comida queda fuera por definición de ventanas."""
+    """Minutos dentro de ventanas laborales por día; convierte a hora local antes de calcular."""
     if pd.isna(start) or pd.isna(end):
         return 0.0
+    # asegurar local naive
+    start = as_local_naive(start)
+    end   = as_local_naive(end)
     if end < start:
         start, end = end, start
     total = 0.0
@@ -135,13 +171,6 @@ def find_col(df: pd.DataFrame, keys: List[str]) -> Optional[str]:
     return None
 
 def normalize_rates(df_in: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza tarifas por área desde tu Excel:
-      - Detecta columna de departamento (depto/area/área/…)
-      - Si hay columna $/hr, la usa como precio_hora
-      - Si hay columna semanal ($ sem, semana, semanal), deriva precio_hora = semanal / WEEKLY_HOURS_DEFAULT
-      - Calcula precio_minuto = precio_hora / 60 si hace falta
-    """
     cols_out = ["DEPTO", "precio_minuto", "precio_pieza", "precio_hora"]
     if df_in is None or df_in.empty:
         return pd.DataFrame(columns=cols_out)
@@ -428,8 +457,7 @@ def show_pdf_file(path: str, height: int = 680):
 # Derivados en vivo (minutos/pago) y export Nómina
 # =========================
 def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFrame:
-    """Agrega columnas derivadas: Minutos_Calc (en vivo: si Inicio==Fin, usa ahora), Pago_Calc, Esquema_Calc, Tarifa_Calc.
-       Si Minutos_Proceso/Pago están vacíos o 0, muestra los calculados."""
+    """Agrega columnas derivadas y convierte tiempos a hora local para vista/cálculo."""
     if df.empty:
         return df
     d = df.copy()
@@ -438,17 +466,17 @@ def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFra
     if "DEPTO" in d.columns:
         d["DEPTO"] = d["DEPTO"].map(norm_depto)
     if "Inicio" in d.columns:
-        d["Inicio"] = pd.to_datetime(d["Inicio"], errors="coerce")
+        # parsear como UTC y convertir a local tz-aware
+        d["Inicio"] = pd.to_datetime(d["Inicio"], errors="coerce", utc=True).dt.tz_convert(LOCAL_TZ)
     if "Fin" in d.columns:
-        d["Fin"] = pd.to_datetime(d["Fin"], errors="coerce")
+        d["Fin"] = pd.to_datetime(d["Fin"], errors="coerce", utc=True).dt.tz_convert(LOCAL_TZ)
 
-    now = datetime.now()
+    now_loc = datetime.now(LOCAL_TZ)
 
     def mins_row(r):
         ini, fin = r.get("Inicio"), r.get("Fin")
-        # "Abierto": Inicio==Fin o Fin nulo → tomar ahora como Fin para mostrar avance
         if pd.notna(ini) and (pd.isna(fin) or ini == fin):
-            return working_minutes_between(ini, now)
+            return working_minutes_between(ini, now_loc)
         if pd.notna(ini) and pd.notna(fin):
             return working_minutes_between(ini, fin)
         return float(r.get("Minutos_Proceso", 0) or 0)
@@ -482,29 +510,34 @@ def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFra
     d["Minutos_Proceso"] = d["Minutos_Proceso"].round(2)
     d["Pago"] = d["Pago"].round(2)
 
-    # auxiliares para agrupaciones
+    # auxiliares para agrupaciones (desde hora local)
     if "Inicio" in d.columns:
-        d["Fecha"] = d["Inicio"].dt.date
+        d["Fecha"] = d["Inicio"].dt.tz_convert(LOCAL_TZ).dt.date
     if "Semana" not in d.columns and "Inicio" in d.columns:
         d["Semana"] = d["Inicio"].dt.isocalendar().week
 
     return d
 
 def export_nomina(df: pd.DataFrame) -> bytes:
-    """Genera un XLSX con:
-       - Detalle por registro
-       - Totales por empleado/fecha (día)
-       - Totales por empleado/semana
-    """
+    """Genera un XLSX (horas en LOCAL, sin tz)."""
     output = io.BytesIO()
+    df_x = df.copy()
+    # quitar tz para Excel, manteniendo la hora local ya convertida
+    for col in ["Inicio", "Fin"]:
+        if col in df_x.columns:
+            try:
+                df_x[col] = pd.to_datetime(df_x[col], errors="coerce").dt.tz_localize(None)
+            except Exception:
+                pass
+
     with pd.ExcelWriter(output, engine="openpyxl") as xw:
         # Detalle
-        detalle_cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana","Fecha"] if c in df.columns]
-        df[detalle_cols].to_excel(xw, index=False, sheet_name="Detalle")
+        detalle_cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana","Fecha"] if c in df_x.columns]
+        df_x[detalle_cols].to_excel(xw, index=False, sheet_name="Detalle")
 
         # Día
-        if {"EMPLEADO","Fecha","Pago","Minutos_Proceso"}.issubset(df.columns):
-            dia = (df.groupby(["EMPLEADO","Fecha"], dropna=False)
+        if {"EMPLEADO","Fecha","Pago","Minutos_Proceso"}.issubset(df_x.columns):
+            dia = (df_x.groupby(["EMPLEADO","Fecha"], dropna=False)
                      .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
                      .reset_index())
             dia["Horas"] = (dia["Minutos"] / 60).round(2)
@@ -512,8 +545,8 @@ def export_nomina(df: pd.DataFrame) -> bytes:
             dia.to_excel(xw, index=False, sheet_name="Nomina_Diaria")
 
         # Semana
-        if {"EMPLEADO","Semana","Pago","Minutos_Proceso"}.issubset(df.columns):
-            sem = (df.groupby(["EMPLEADO","Semana"], dropna=False)
+        if {"EMPLEADO","Semana","Pago","Minutos_Proceso"}.issubset(df_x.columns):
+            sem = (df_x.groupby(["EMPLEADO","Semana"], dropna=False)
                      .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
                      .reset_index())
             sem["Horas"] = (sem["Minutos"] / 60).round(2)
@@ -533,24 +566,21 @@ tabs = st.tabs([
 ])
 
 # =========================
-# 📲 Captura  (CORREGIDO: Empleado depende de Depto en tiempo real)
+# 📲 Captura  (Empleado depende de Depto + TZ FIX)
 # =========================
 PLACEHOLDER_EMP = "— Selecciona —"
 
 def _reset_emp_on_depto_change():
-    # Al cambiar el depto, reiniciar la selección del empleado para forzar lista limpia
     st.session_state["cap_emp_choice"] = PLACEHOLDER_EMP
 
 with tabs[0]:
     st.subheader("Captura móvil")
     rates = load_rates_csv()
-    # departamentos dinámicos desde tarifas (si no hay, usar fallback)
     if not rates.empty:
         dept_options = sorted(list(set(DEPT_FALLBACK) | set(rates["DEPTO"].dropna().astype(str).tolist())))
     else:
         dept_options = DEPT_FALLBACK
 
-    # Departamento FUERA del form, con on_change que reinicia empleado
     depto = st.selectbox(
         "Departamento*",
         options=dept_options,
@@ -561,11 +591,9 @@ with tabs[0]:
         help="Al cambiar, se reinicia y recarga el catálogo de empleados."
     )
 
-    # opciones dependientes del depto seleccionado
     empleados_opts = emp_options_for(depto)
     modelos_opts = load_model_catalog()
 
-    # Asegurar valor por defecto coherente con la lista actual
     if st.session_state.get("cap_emp_choice") not in ([PLACEHOLDER_EMP] + empleados_opts):
         st.session_state["cap_emp_choice"] = PLACEHOLDER_EMP
 
@@ -593,14 +621,14 @@ with tabs[0]:
                 st.error("Selecciona un **Modelo** (agrégalo en 🛠️ Admin si no aparece).")
                 st.stop()
 
-            ahora = datetime.now()
+            ahora_utc = now_utc()
             db = load_parquet(DB_FILE)
 
             # Cerrar trabajo abierto del mismo empleado (Inicio==Fin)
             if not db.empty and {"EMPLEADO", "Inicio", "Fin"}.issubset(db.columns):
                 try:
-                    db["Inicio"] = pd.to_datetime(db["Inicio"], errors="coerce")
-                    db["Fin"] = pd.to_datetime(db["Fin"], errors="coerce")
+                    db["Inicio"] = pd.to_datetime(db["Inicio"], errors="coerce", utc=True)
+                    db["Fin"] = pd.to_datetime(db["Fin"], errors="coerce", utc=True)
                 except Exception:
                     pass
 
@@ -612,14 +640,14 @@ with tabs[0]:
 
                 if not abiertos.empty:
                     idx_last = abiertos.index[-1]
-                    ini_prev = pd.to_datetime(db.at[idx_last, "Inicio"])
-                    fin_prev = ahora
+                    ini_prev_utc = db.at[idx_last, "Inicio"]
+                    fin_prev_utc = ahora_utc
 
-                    minutos_ef = working_minutes_between(ini_prev, fin_prev)
+                    minutos_ef = working_minutes_between(ini_prev_utc, fin_prev_utc)  # convierte a local adentro
                     produce_prev = num(db.at[idx_last, "Produce"] if "Produce" in db.columns else 0.0)
                     min_std_prev = num(db.at[idx_last, "Minutos_Std"] if "Minutos_Std" in db.columns else 0.0)
 
-                    db.at[idx_last, "Fin"] = fin_prev
+                    db.at[idx_last, "Fin"] = fin_prev_utc
                     db.at[idx_last, "Minutos_Proceso"] = minutos_ef
 
                     pago, esquema, tarifa = calc_pago_row(
@@ -637,20 +665,20 @@ with tabs[0]:
                     save_parquet(db, DB_FILE)
                     log_audit(
                         st.session_state.user, "auto-close", int(idx_last),
-                        {"empleado": empleado, "cerrado": fin_prev, "minutos_efectivos": minutos_ef, "pago": pago}
+                        {"empleado": empleado, "cerrado": fin_prev_utc, "minutos_efectivos": minutos_ef, "pago": pago}
                     )
 
-            # Nuevo registro "abierto"
+            # Nuevo registro "abierto" (UTC)
             row = {
                 "DEPTO": norm_depto(depto),
                 "EMPLEADO": empleado,
                 "MODELO": modelo,
                 "Produce": produce,
-                "Inicio": ahora,
-                "Fin": ahora,            # abierto (se cerrará con la siguiente asignación)
+                "Inicio": ahora_utc,
+                "Fin": ahora_utc,        # abierto (se cerrará con la siguiente asignación)
                 "Minutos_Proceso": 0.0,  # se calcula al cerrar
                 "Minutos_Std": minutos_std,
-                "Semana": week_number(ahora),
+                "Semana": week_number(to_local(ahora_utc)),
                 "Usuario": st.session_state.user,
                 "Estimado": True,
                 "Pago": 0.0,
@@ -665,7 +693,7 @@ with tabs[0]:
             st.success("Registro guardado ✅ (si había uno abierto, se cerró con minutos efectivos y pago).")
 
 # =========================
-# 📈 Tablero (con cálculo en vivo, diarios/semanales y export)
+# 📈 Tablero (cálculo en vivo, diarios/semanales y export)
 # =========================
 with tabs[1]:
     st.subheader("Producción en vivo")
@@ -696,8 +724,17 @@ with tabs[1]:
             if f_emp:
                 fdf = fdf[fdf["EMPLEADO"].astype(str).str.contains(f_emp, case=False, na=False)]
 
-        cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana","Fecha"] if c in fdf.columns]
-        st.dataframe(fdf.sort_values(by="Inicio", ascending=False)[cols],
+        # formateo legible local
+        view = fdf.copy()
+        for col in ["Inicio","Fin"]:
+            if col in view.columns:
+                try:
+                    view[col] = pd.to_datetime(view[col], errors="coerce").dt.tz_convert(LOCAL_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+
+        cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana","Fecha"] if c in view.columns]
+        st.dataframe(view.sort_values(by="Inicio", ascending=False)[cols],
                      use_container_width=True, hide_index=True)
 
         # Totales por día (empleado/fecha)
@@ -817,7 +854,7 @@ with tabs[2]:
                     st.caption(f"Etiquetas: {r['tags'] or '—'} · Por: {r['uploaded_by']} · {r['ts']}")
 
 # =========================
-# ✏️ Editar / Auditar (FIX keys)
+# ✏️ Editar / Auditar (FIX TZ en UI/Admin)
 # =========================
 with tabs[3]:
     st.subheader("Edición (solo Admin mueve tiempos) + Bitácora")
@@ -867,40 +904,42 @@ with tabs[3]:
                 )
 
             with c2:
-                ini_raw = pd.to_datetime(row.get("Inicio"), errors="coerce")
-                fin_raw = pd.to_datetime(row.get("Fin"), errors="coerce")
+                ini_raw_utc = pd.to_datetime(row.get("Inicio"), errors="coerce", utc=True)
+                fin_raw_utc = pd.to_datetime(row.get("Fin"), errors="coerce", utc=True)
+                ini_local = to_local(ini_raw_utc) if pd.notna(ini_raw_utc) else None
+                fin_local = to_local(fin_raw_utc) if pd.notna(fin_raw_utc) else None
 
                 if st.session_state.get("role") == "Admin":
                     ini_date = st.date_input(
                         "Inicio (fecha)",
-                        ini_raw.date() if pd.notna(ini_raw) else date.today(),
+                        ini_local.date() if ini_local else date.today(),
                         key="audit_ini_date",
                     )
                     ini_time = st.time_input(
                         "Inicio (hora)",
-                        ini_raw.time() if pd.notna(ini_raw) else datetime.now().time().replace(second=0, microsecond=0),
+                        (ini_local.time().replace(second=0, microsecond=0) if ini_local else datetime.now(LOCAL_TZ).time().replace(second=0, microsecond=0)),
                         key="audit_ini_time",
                     )
                     fin_date = st.date_input(
                         "Fin (fecha)",
-                        fin_raw.date() if pd.notna(fin_raw) else date.today(),
+                        fin_local.date() if fin_local else date.today(),
                         key="audit_fin_date",
                     )
                     fin_time = st.time_input(
                         "Fin (hora)",
-                        fin_raw.time() if pd.notna(fin_raw) else datetime.now().time().replace(second=0, microsecond=0),
+                        (fin_local.time().replace(second=0, microsecond=0) if fin_local else datetime.now(LOCAL_TZ).time().replace(second=0, microsecond=0)),
                         key="audit_fin_time",
                     )
-                    inicio = datetime.combine(ini_date, ini_time)
-                    fin    = datetime.combine(fin_date, fin_time)
+                    # Combina como hora local y luego pasa a UTC para guardar
+                    inicio = to_utc(datetime.combine(ini_date, ini_time))
+                    fin    = to_utc(datetime.combine(fin_date, fin_time))
                 else:
-                    st.write("Inicio:", ini_raw)
-                    st.write("Fin:", fin_raw)
-                    inicio, fin = ini_raw, fin_raw
+                    st.write("Inicio:", ini_local)
+                    st.write("Fin:", fin_local)
+                    inicio, fin = ini_raw_utc, fin_raw_utc
 
             submitted = st.form_submit_button("💾 Guardar cambios", type="primary", key="audit_submit")
 
-        # OJO: el 'if submitted' va fuera del 'with st.form(...)'
         if submitted:
             before = db.iloc[int(idx_num)].to_dict()
 
@@ -1027,4 +1066,4 @@ with tabs[4]:
                 except Exception as e:
                     st.error(f"No pude leer el Excel: {e}")
 
-st.caption("© 2025 · Destajo móvil con horarios, tarifas por área, catálogos, visor de PDFs, tablero y nómina (día/semana).")
+st.caption("©️ 2025 · Destajo móvil con horarios, tarifas por área, catálogos, visor de PDFs, tablero y nómina (día/semana).")
