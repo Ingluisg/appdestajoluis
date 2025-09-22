@@ -1,4 +1,4 @@
- # app.py — Destajo con Horarios, Tarifas desde Excel, Catálogos, PDFs, Tablero y Nómina (día/semana)
+# app.py — Destajo con Horarios, Tarifas desde Excel, Catálogos, PDFs, Tablero y Nómina (día/semana)
 # ©️ 2025
 
 import os, json, base64, re, hashlib, math, io
@@ -799,7 +799,8 @@ with tabs[2]:
                                                mime="application/pdf", key=f"dl_{r['id']}", use_container_width=True)
                         except Exception as e:
                             st.error(f"Descarga falló: {e}")
-                    if st.session_state.get(f"open_{r['id']}"]):
+                    # FIX: remove stray bracket and provide default False
+                    if st.session_state.get(f"open_{r['id']}", False):
                         show_pdf_file(abs_path, height=600)
                         st.divider()
                     st.caption(f"Etiquetas: {r['tags'] or '—'} · Por: {r['uploaded_by']} · {r['ts']}")
@@ -956,7 +957,7 @@ with tabs[4]:
 
         rates_file = st.file_uploader("Subir Excel de tarifas (hoja 'tiempos')", type=["xlsx", "xls"])
         sheet_name = st.text_input("Nombre de hoja (default 'tiempos')", value=DEFAULT_RATE_SHEET)
-        if st	button("Procesar tarifas"):
+        if st.button("Procesar tarifas"):
             if not rates_file:
                 st.error("Adjunta un archivo Excel.")
             else:
