@@ -1065,5 +1065,77 @@ with tabs[4]:
                     st.rerun()
                 except Exception as e:
                     st.error(f"No pude leer el Excel: {e}")
+                    # --- Editor manual de tarifas (alta/edición por área) ---
+st.markdown("---")
+st.subheader("Editor manual de tarifas por área")
+
+# Sugerir lista de deptos a partir de tarifas existentes + fallback
+_rates_existing = load_rates_csv()
+_dept_all = (sorted(list(set(DEPT_FALLBACK) | set(_rates_existing["DEPTO"].dropna().astype(str).tolist())))
+             if not _rates_existing.empty else DEPT_FALLBACK)
+
+c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1])
+with c1:
+    dep_in = st.selectbox("Departamento", _dept_all, index=0, key="rates_manual_depto")
+with c2:
+    pago_sem = st.number_input("Pago por semana ($)", min_value=0.0, step=1.0, value=0.0, key="rates_manual_sem")
+with c3:
+    pago_hr  = st.number_input("Pago por hora ($)", min_value=0.0, step=0.5, value=0.0, key="rates_manual_hr")
+with c4:
+    horas_sem = st.number_input("Horas por semana", min_value=1.0, step=1.0, value=55.0, key="rates_manual_horas")
+
+# Cálculo previo
+precio_hora_calc = (pago_sem / horas_sem) if pago_sem > 0 else 0.0
+# Si usuario dio precio por hora, ese manda
+if pago_hr > 0:
+    precio_hora_calc = pago_hr
+precio_min_calc = round(precio_hora_calc / 60.0, 4) if precio_hora_calc > 0 else 0.0
+
+st.caption(f"Pré-cálculo → precio_hora: **${precio_hora_calc:.2f}/h** · precio_minuto: **${precio_min_calc:.4f}/min**")
+
+colA, colB = st.columns([1, 2])
+with colA:
+    if st.button("💾 Guardar / Actualizar tarifa", type="primary", use_container_width=True, key="btn_save_manual_rate"):
+        dep_norm = norm_depto(dep_in)
+        # cargar existentes y preparar df destino
+        rates_df = load_rates_csv()
+        if rates_df.empty:
+            rates_df = pd.DataFrame(columns=["DEPTO","precio_minuto","precio_pieza","precio_hora"])
+
+        # upsert por DEPTO
+        new_row = pd.DataFrame([{
+            "DEPTO": dep_norm,
+            "precio_minuto": round(precio_min_calc, 4) if precio_min_calc > 0 else np.nan,
+            "precio_pieza":  np.nan,
+            "precio_hora":   round(precio_hora_calc, 2) if precio_hora_calc > 0 else np.nan,
+        }])
+
+        rates_df = rates_df[rates_df["DEPTO"] != dep_norm]
+        rates_df = pd.concat([rates_df, new_row], ignore_index=True)
+        rates_df = rates_df.sort_values("DEPTO").reset_index(drop=True)
+
+        rates_df.to_csv(RATES_CSV, index=False)
+        st.success(f"Tarifa de **{dep_norm}** guardada: ${precio_hora_calc:.2f}/h · ${precio_min_calc:.4f}/min")
+        st.experimental_rerun()
+
+with colB:
+    if not _rates_existing.empty:
+        st.dataframe(_rates_existing.sort_values("DEPTO").reset_index(drop=True),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.caption("Aún no hay tarifas guardadas. Usa el formulario para agregar la primera.")
+
+# (Opcional) Borrar tarifa existente
+with st.expander("🗑️ Borrar tarifa de un departamento", expanded=False):
+    rates_now = load_rates_csv()
+    if rates_now.empty:
+        st.caption("No hay tarifas para borrar.")
+    else:
+        dept_to_del = st.selectbox("Departamento a borrar", rates_now["DEPTO"].dropna().astype(str).tolist(), key="rates_del_depto")
+        if st.button("Eliminar", key="btn_del_rate"):
+            rates_now = rates_now[rates_now["DEPTO"] != dept_to_del]
+            rates_now.to_csv(RATES_CSV, index=False)
+            st.success(f"Tarifa de **{dept_to_del}** eliminada.")
+            st.experimental_rerun()
 
 st.caption("©️ 2025 · Destajo móvil con horarios, tarifas por área, catálogos, visor de PDFs, tablero y nómina (día/semana).")
