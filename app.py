@@ -1,4 +1,4 @@
-# app.py — Destajo con Horarios, Tarifas desde Excel, Catálogos, PDFs, Tablero y Nómina (día/semana)
+# app.py — Destajo: Horario, Tarifas, Modelos (min estándar), PDFs, Tablero y Nómina
 # ©️ 2025
 
 import os, json, base64, re, hashlib, math, io
@@ -26,12 +26,13 @@ USERS_FILE = "users.csv"
 # Catálogos
 CAT_EMP = os.path.join(DATA_DIR, "cat_empleados.csv")   # columnas: departamento,empleado,(opcional) orden
 CAT_MOD = os.path.join(DATA_DIR, "cat_modelos.csv")     # columna: modelo
+CAT_MODELO_STD = os.path.join(DATA_DIR, "modelos_std.csv")  # columnas: MODELO, MINUTOS_STD (por pieza)
 
 # Tarifas (área)
 RATES_CSV = os.path.join(DATA_DIR, "rates.csv")         # normalizado desde Excel (hoja 'tiempos')
 RATES_XLSX = os.path.join(DATA_DIR, "rates_source.xlsx")
 DEFAULT_RATE_SHEET = "tiempos"
-WEEKLY_HOURS_DEFAULT = 55  # se usa al normalizar Excel
+WEEKLY_HOURS_DEFAULT = 55  # horas por semana
 
 # Documentos PDF
 DOCS_DIR = os.path.join(DATA_DIR, "docs")
@@ -248,6 +249,21 @@ def calc_pago_row(depto: str, produce: float, minutos_ef: float, minutos_std: fl
         return (round((minutos_ef / 60.0) * tarifa_hr, 2), "hora", tarifa_hr)
     return (0.0, "sin_tarifa", 0.0)
 
+def calc_pago_estandar(depto: str, produce: float, minutos_estandar: float, rates: pd.DataFrame) -> float:
+    """Pago teórico usando minutos estándar por MODELO (por pieza * piezas)."""
+    dep = norm_depto(depto)
+    r = rates[rates["DEPTO"] == dep]
+    tarifa_min = float(r["precio_minuto"].iloc[0]) if not r.empty and pd.notna(r["precio_minuto"].iloc[0]) else math.nan
+    tarifa_pza = float(r["precio_pieza"].iloc[0]) if not r.empty and pd.notna(r["precio_pieza"].iloc[0]) else math.nan
+    tarifa_hr  = float(r["precio_hora"].iloc[0])  if not r.empty and pd.notna(r["precio_hora"].iloc[0])  else math.nan
+    if not math.isnan(tarifa_min):
+        return round(minutos_estandar * tarifa_min, 2)
+    if not math.isnan(tarifa_hr):
+        return round((minutos_estandar / 60.0) * tarifa_hr, 2)
+    if not math.isnan(tarifa_pza):
+        return round(produce * tarifa_pza, 2)
+    return 0.0
+
 # =========================
 # Usuarios y roles
 # =========================
@@ -304,7 +320,7 @@ if st.sidebar.button("Cerrar sesión"):
     st.rerun()
 
 # =========================
-# Catálogos (preservar orden del CSV)
+# Catálogos
 # =========================
 def load_emp_catalog() -> pd.DataFrame:
     if os.path.exists(CAT_EMP):
@@ -359,6 +375,32 @@ def load_model_catalog() -> List[str]:
 def save_model_catalog(items: List[str]):
     clean = list(dict.fromkeys([str(x).strip() for x in items if str(x).strip()]))
     pd.DataFrame({"modelo": clean}).to_csv(CAT_MOD, index=False)
+
+def load_model_std() -> pd.DataFrame:
+    if os.path.exists(CAT_MODELO_STD):
+        try:
+            df = pd.read_csv(CAT_MODELO_STD)
+            df.columns = [c.strip().upper() for c in df.columns]
+            if not {"MODELO","MINUTOS_STD"}.issubset(df.columns):
+                return pd.DataFrame(columns=["MODELO","MINUTOS_STD"])
+            df["MODELO"] = df["MODELO"].astype(str).str.strip()
+            df["MINUTOS_STD"] = pd.to_numeric(df["MINUTOS_STD"], errors="coerce").fillna(0.0)
+            return df[["MODELO","MINUTOS_STD"]]
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["MODELO","MINUTOS_STD"])
+
+def save_model_std(df: pd.DataFrame):
+    if df is None or df.empty:
+        pd.DataFrame(columns=["MODELO","MINUTOS_STD"]).to_csv(CAT_MODELO_STD, index=False)
+        return
+    out = df.copy()
+    out.columns = [c.strip().upper() for c in out.columns]
+    out = out[["MODELO","MINUTOS_STD"]]
+    out["MODELO"] = out["MODELO"].astype(str).str.strip()
+    out["MINUTOS_STD"] = pd.to_numeric(out["MINUTOS_STD"], errors="coerce").fillna(0.0)
+    out = out.drop_duplicates(subset=["MODELO"], keep="last")
+    out.to_csv(CAT_MODELO_STD, index=False)
 
 # =========================
 # Auditoría
@@ -448,8 +490,8 @@ def show_pdf_file(path: str, height: int = 680):
 # =========================
 # Derivados en vivo (minutos/pago) y export Nómina
 # =========================
-def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFrame:
-    """Agrega columnas derivadas y convierte tiempos a hora local para vista/cálculo."""
+def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame, modelos_std: pd.DataFrame) -> pd.DataFrame:
+    """Agrega columnas derivadas y convierte tiempos a hora local. Calcula también pago estándar."""
     if df.empty:
         return df
     d = df.copy()
@@ -474,18 +516,36 @@ def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFra
 
     d["Minutos_Calc"] = d.apply(mins_row, axis=1).astype(float)
 
+    # Pago real (según minutos efectivos) y tarifa
     def pay_row(r):
         p, esq, tar = calc_pago_row(
             str(r.get("DEPTO","")).upper(),
             num(r.get("Produce"), 0.0),
             float(r.get("Minutos_Calc", 0.0)),
-            num(r.get("Minutos_Std"), 0.0),
+            0.0,
             rates
         )
         return pd.Series({"Pago_Calc": p, "Esquema_Calc": esq, "Tarifa_Calc": tar})
 
     d = pd.concat([d, d.apply(pay_row, axis=1)], axis=1)
 
+    # Pago estándar (minutos por modelo * piezas)
+    modelos_std = modelos_std.copy()
+    if not modelos_std.empty:
+        modelos_std["MODELO"] = modelos_std["MODELO"].astype(str).str.strip()
+        d["MODELO"] = d["MODELO"].astype(str).str.strip()
+        d = d.merge(modelos_std, how="left", on="MODELO")
+        d["MINUTOS_STD"] = pd.to_numeric(d["MINUTOS_STD"], errors="coerce").fillna(0.0)
+        d["Minutos_Estandar"] = (pd.to_numeric(d.get("Produce", 0), errors="coerce").fillna(0.0) * d["MINUTOS_STD"]).round(2)
+        d["Pago_Estandar"] = d.apply(
+            lambda r: calc_pago_estandar(str(r.get("DEPTO","")), num(r.get("Produce"),0.0), float(r.get("Minutos_Estandar",0.0)), rates),
+            axis=1
+        )
+    else:
+        d["Minutos_Estandar"] = 0.0
+        d["Pago_Estandar"] = 0.0
+
+    # Resolver columnas visibles
     if "Minutos_Proceso" in d.columns:
         d["Minutos_Proceso"] = np.where(pd.to_numeric(d["Minutos_Proceso"], errors="coerce").fillna(0) > 0,
                                         d["Minutos_Proceso"], d["Minutos_Calc"])
@@ -507,10 +567,14 @@ def compute_minutes_and_pay(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFra
     if "Semana" not in d.columns and "Inicio" in d.columns:
         d["Semana"] = d["Inicio"].dt.isocalendar().week
 
+    # métricas comparativas
+    d["Diferencia_Pago"] = (d["Pago"] - d["Pago_Estandar"]).round(2)
+    d["Eficiencia"] = np.where(d["Minutos_Estandar"] > 0, (d["Minutos_Estandar"] / d["Minutos_Proceso"]).round(2), np.nan)
+
     return d
 
 def export_nomina(df: pd.DataFrame) -> bytes:
-    """Genera un XLSX con Detalle, Totales por día (incluye MODELO) y Totales por semana (incluye MODELO)."""
+    """Genera un XLSX con Detalle (incluye pagos estándar), Día y Semana."""
     output = io.BytesIO()
     df_x = df.copy()
     for col in ["Inicio", "Fin"]:
@@ -520,27 +584,33 @@ def export_nomina(df: pd.DataFrame) -> bytes:
             except Exception:
                 pass
     with pd.ExcelWriter(output, engine="openpyxl") as xw:
-        detalle_cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana","Fecha"] if c in df_x.columns]
+        detalle_cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Minutos_Estandar","Pago_Estandar","Diferencia_Pago","Semana","Fecha"] if c in df_x.columns]
         df_x[detalle_cols].to_excel(xw, index=False, sheet_name="Detalle")
 
-        need_day = {"EMPLEADO","MODELO","Fecha","Pago","Minutos_Proceso"}
+        need_day = {"EMPLEADO","MODELO","Fecha","Pago","Minutos_Proceso","Pago_Estandar"}
         if need_day.issubset(df_x.columns):
             dia = (df_x.groupby(["EMPLEADO","MODELO","Fecha"], dropna=False)
-                     .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
+                     .agg(Pagos_Real=("Pago","sum"),
+                          Pagos_Estandar=("Pago_Estandar","sum"),
+                          Minutos=("Minutos_Proceso","sum"),
+                          Min_Estd=("Minutos_Estandar","sum"),
+                          Piezas=("Produce","sum"))
                      .reset_index())
             dia["Horas"] = (dia["Minutos"] / 60).round(2)
-            dia["Pagos"] = dia["Pagos"].round(2)
-            dia = dia[["EMPLEADO","MODELO","Fecha","Pagos","Minutos","Piezas","Horas"]]
+            dia["Diferencia"] = (dia["Pagos_Real"] - dia["Pagos_Estandar"]).round(2)
             dia.to_excel(xw, index=False, sheet_name="Nomina_Diaria")
 
-        need_week = {"EMPLEADO","MODELO","Semana","Pago","Minutos_Proceso"}
+        need_week = {"EMPLEADO","MODELO","Semana","Pago","Minutos_Proceso","Pago_Estandar"}
         if need_week.issubset(df_x.columns):
             sem = (df_x.groupby(["EMPLEADO","MODELO","Semana"], dropna=False)
-                     .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
+                     .agg(Pagos_Real=("Pago","sum"),
+                          Pagos_Estandar=("Pago_Estandar","sum"),
+                          Minutos=("Minutos_Proceso","sum"),
+                          Min_Estd=("Minutos_Estandar","sum"),
+                          Piezas=("Produce","sum"))
                      .reset_index())
             sem["Horas"] = (sem["Minutos"] / 60).round(2)
-            sem["Pagos"] = sem["Pagos"].round(2)
-            sem = sem[["EMPLEADO","MODELO","Semana","Pagos","Minutos","Piezas","Horas"]]
+            sem["Diferencia"] = (sem["Pagos_Real"] - sem["Pagos_Estandar"]).round(2)
             sem.to_excel(xw, index=False, sheet_name="Nomina_Semanal")
     return output.getvalue()
 
@@ -550,7 +620,7 @@ def export_nomina(df: pd.DataFrame) -> bytes:
 tabs = st.tabs(["📲 Captura", "📈 Tablero", "📚 Plantillas & Diagramas", "✏️ Editar / Auditar", "🛠️ Admin"])
 
 # =========================
-# 📲 Captura
+# 📲 Captura (sin Minutos Std)
 # =========================
 PLACEHOLDER_EMP = "— Selecciona —"
 def _reset_emp_on_depto_change():
@@ -578,7 +648,6 @@ with tabs[0]:
         with c2:
             modelo_choice = st.selectbox("Modelo*", [PLACEHOLDER_EMP] + modelos_opts, key="cap_modelo_choice")
             produce = st.number_input("Produce (piezas)*", min_value=1, step=1, value=1, key="cap_produce")
-            minutos_std = st.number_input("Minutos Std (por pieza)*", min_value=0.0, step=0.5, value=0.0, key="cap_min_std")
 
         if st.form_submit_button("➕ Agregar registro", use_container_width=True):
             empleado = emp_choice if emp_choice != PLACEHOLDER_EMP else ""
@@ -608,11 +677,10 @@ with tabs[0]:
                     fin_prev_utc = ahora_utc
                     minutos_ef = working_minutes_between(ini_prev_utc, fin_prev_utc)
                     produce_prev = num(db.at[idx_last, "Produce"] if "Produce" in db.columns else 0.0)
-                    min_std_prev = num(db.at[idx_last, "Minutos_Std"] if "Minutos_Std" in db.columns else 0.0)
 
                     db.at[idx_last, "Fin"] = fin_prev_utc
                     db.at[idx_last, "Minutos_Proceso"] = minutos_ef
-                    pago, esquema, tarifa = calc_pago_row(str(db.at[idx_last, "DEPTO"]).strip().upper(), produce_prev, minutos_ef, min_std_prev, rates)
+                    pago, esquema, tarifa = calc_pago_row(str(db.at[idx_last, "DEPTO"]).strip().upper(), produce_prev, minutos_ef, 0.0, rates)
                     db.at[idx_last, "Pago"] = pago
                     db.at[idx_last, "Esquema_Pago"] = esquema
                     db.at[idx_last, "Tarifa_Base"] = tarifa
@@ -631,7 +699,6 @@ with tabs[0]:
                 "Inicio": ahora_utc,
                 "Fin": ahora_utc,        # abierto
                 "Minutos_Proceso": 0.0,  # se calcula al cerrar
-                "Minutos_Std": minutos_std,
                 "Semana": week_number(to_local(ahora_utc)),
                 "Usuario": st.session_state.user,
                 "Estimado": True,
@@ -652,10 +719,11 @@ with tabs[1]:
     st.subheader("Producción en vivo")
     base = load_parquet(DB_FILE)
     rates = load_rates_csv()
+    modelos_std = load_model_std()
     if base.empty:
         st.info("Sin registros.")
     else:
-        show = compute_minutes_and_pay(base, rates)
+        show = compute_minutes_and_pay(base, rates, modelos_std)
 
         # Avisar si hay deptos sin tarifa
         if not rates.empty and "DEPTO" in show.columns:
@@ -686,32 +754,37 @@ with tabs[1]:
                 except Exception:
                     pass
 
-        cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Pago","Semana","Fecha"] if c in view.columns]
+        cols = [c for c in ["DEPTO","EMPLEADO","MODELO","Produce","Inicio","Fin","Minutos_Proceso","Minutos_Estandar","Pago","Pago_Estandar","Diferencia_Pago","Semana","Fecha"] if c in view.columns]
         st.dataframe(view.sort_values(by="Inicio", ascending=False)[cols], use_container_width=True, hide_index=True)
 
-        # Totales por día (incluye MODELO)
-        st.markdown("### Pagos por día")
-        if {"EMPLEADO","MODELO","Fecha","Pago","Minutos_Proceso"}.issubset(fdf.columns):
+        # Totales por día (incluye comparación)
+        st.markdown("### Pagos por día (real vs estándar)")
+        if {"EMPLEADO","MODELO","Fecha","Pago","Pago_Estandar","Minutos_Proceso","Minutos_Estandar"}.issubset(fdf.columns):
             dia = (fdf.groupby(["EMPLEADO","MODELO","Fecha"], dropna=False)
-                     .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
+                     .agg(Pagos_Real=("Pago","sum"),
+                          Pagos_Estandar=("Pago_Estandar","sum"),
+                          Minutos=("Minutos_Proceso","sum"),
+                          Min_Estd=("Minutos_Estandar","sum"),
+                          Piezas=("Produce","sum"))
                      .reset_index())
             dia["Horas"] = (dia["Minutos"] / 60).round(2)
-            dia["Pagos"] = dia["Pagos"].round(2)
-            dia = dia[["EMPLEADO","MODELO","Fecha","Pagos","Minutos","Piezas","Horas"]]
+            dia["Diferencia"] = (dia["Pagos_Real"] - dia["Pagos_Estandar"]).round(2)
             st.dataframe(dia.sort_values(["Fecha","EMPLEADO","MODELO"]), use_container_width=True, hide_index=True)
 
-        # Totales por semana (incluye MODELO) + export
-        st.markdown("### Pagos por semana")
-        if {"EMPLEADO","MODELO","Semana","Pago","Minutos_Proceso"}.issubset(fdf.columns):
+        # Totales por semana (incluye comparación) + export
+        st.markdown("### Pagos por semana (real vs estándar)")
+        if {"EMPLEADO","MODELO","Semana","Pago","Pago_Estandar","Minutos_Proceso","Minutos_Estandar"}.issubset(fdf.columns):
             sem = (fdf.groupby(["EMPLEADO","MODELO","Semana"], dropna=False)
-                     .agg(Pagos=("Pago","sum"), Minutos=("Minutos_Proceso","sum"), Piezas=("Produce","sum"))
+                     .agg(Pagos_Real=("Pago","sum"),
+                          Pagos_Estandar=("Pago_Estandar","sum"),
+                          Minutos=("Minutos_Proceso","sum"),
+                          Min_Estd=("Minutos_Estandar","sum"),
+                          Piezas=("Produce","sum"))
                      .reset_index())
             sem["Horas"] = (sem["Minutos"] / 60).round(2)
-            sem["Pagos"] = sem["Pagos"].round(2)
-            sem = sem[["EMPLEADO","MODELO","Semana","Pagos","Minutos","Piezas","Horas"]]
+            sem["Diferencia"] = (sem["Pagos_Real"] - sem["Pagos_Estandar"]).round(2)
             st.dataframe(sem.sort_values(["Semana","EMPLEADO","MODELO"]), use_container_width=True, hide_index=True)
 
-            # Exportar nómina (incluye MODELO)
             xls = export_nomina(fdf)
             st.download_button("⬇️ Exportar nómina (Excel)", data=xls,
                                file_name=f"nomina_{date.today().isoformat()}.xlsx",
@@ -799,7 +872,6 @@ with tabs[2]:
                                                mime="application/pdf", key=f"dl_{r['id']}", use_container_width=True)
                         except Exception as e:
                             st.error(f"Descarga falló: {e}")
-                    # FIX: remove stray bracket and provide default False
                     if st.session_state.get(f"open_{r['id']}", False):
                         show_pdf_file(abs_path, height=600)
                         st.divider()
@@ -832,7 +904,6 @@ with tabs[3]:
                 empleado = st.text_input("Empleado", value=str(row.get("EMPLEADO", "")), key="audit_empleado")
                 modelo   = st.text_input("Modelo",  value=str(row.get("MODELO", "")),  key="audit_modelo")
                 produce  = st.number_input("Produce", value=int(num(row.get("Produce"), 0)), min_value=0, key="audit_produce")
-                min_std  = st.number_input("Minutos_Std", value=float(num(row.get("Minutos_Std"), 0.0)), min_value=0.0, step=0.5, key="audit_min_std")
 
             with c2:
                 ini_raw_utc = pd.to_datetime(row.get("Inicio"), errors="coerce", utc=True)
@@ -861,7 +932,6 @@ with tabs[3]:
             db.at[int(idx_num), "EMPLEADO"]     = empleado
             db.at[int(idx_num), "MODELO"]       = modelo
             db.at[int(idx_num), "Produce"]      = num(produce)
-            db.at[int(idx_num), "Minutos_Std"]  = num(min_std)
 
             if st.session_state.get("role") == "Admin":
                 db.at[int(idx_num), "Inicio"] = inicio
@@ -870,7 +940,7 @@ with tabs[3]:
                 minutos_ef = working_minutes_between(inicio, fin)
                 db.at[int(idx_num), "Minutos_Proceso"] = minutos_ef
 
-                pago, esquema, tarifa = calc_pago_row(norm_depto(depto), num(produce), minutos_ef, num(min_std), rates)
+                pago, esquema, tarifa = calc_pago_row(norm_depto(depto), num(produce), minutos_ef, 0.0, rates)
                 db.at[int(idx_num), "Pago"]         = pago
                 db.at[int(idx_num), "Esquema_Pago"] = esquema
                 db.at[int(idx_num), "Tarifa_Base"]  = tarifa
@@ -890,7 +960,7 @@ with tabs[3]:
         st.dataframe(audit.sort_values(by="ts", ascending=False).head(400), use_container_width=True, hide_index=True)
 
 # =========================
-# 🛠️ Admin (incluye editor manual de tarifas SOLO aquí)
+# 🛠️ Admin (incluye editor manual de tarifas + minutos estándar por modelo)
 # =========================
 with tabs[4]:
     if st.session_state.role != "Admin":
@@ -988,7 +1058,7 @@ with tabs[4]:
         with c3:
             pago_hr  = st.number_input("Pago por hora ($)", min_value=0.0, step=0.5, value=0.0, key="rates_manual_hr")
         with c4:
-            horas_sem = st.number_input("Horas por semana", min_value=1.0, step=1.0, value=55.0, key="rates_manual_horas")
+            horas_sem = st.number_input("Horas por semana", min_value=1.0, step=1.0, value=float(WEEKLY_HOURS_DEFAULT), key="rates_manual_horas")
 
         precio_hora_calc = (pago_sem / horas_sem) if pago_sem > 0 else 0.0
         if pago_hr > 0:
@@ -1023,16 +1093,45 @@ with tabs[4]:
             else:
                 st.caption("Aún no hay tarifas guardadas. Usa el formulario para agregar la primera.")
 
-        with st.expander("🗑️ Borrar tarifa de un departamento", expanded=False):
-            rates_now = load_rates_csv()
-            if rates_now.empty:
-                st.caption("No hay tarifas para borrar.")
-            else:
-                dept_to_del = st.selectbox("Departamento a borrar", rates_now["DEPTO"].dropna().astype(str).tolist(), key="rates_del_depto")
-                if st.button("Eliminar", key="btn_del_rate"):
-                    rates_now = rates_now[rates_now["DEPTO"] != dept_to_del]
-                    rates_now.to_csv(RATES_CSV, index=False)
-                    st.success(f"Tarifa de {dept_to_del} eliminada.")
-                    st.rerun()
+        # ------- Editor de minutos estándar por MODELO -------
+        st.markdown("---")
+        st.subheader("Minutos estándar por MODELO (por pieza)")
 
-st.caption("©️ 2025 · Destajo móvil con horarios, tarifas por área, catálogos, visor de PDFs, tablero y nómina (día/semana).")
+        std_df = load_model_std()
+        st.dataframe(std_df, use_container_width=True, hide_index=True)
+        mcol1, mcol2 = st.columns(2)
+        with mcol1:
+            std_modelo = st.text_input("Modelo")
+        with mcol2:
+            std_min = st.number_input("Minutos estándar por pieza", min_value=0.0, step=0.5, value=0.0)
+        cc1, cc2, cc3 = st.columns([1,1,1])
+        with cc1:
+            if st.button("➕ Guardar/Actualizar estándar"):
+                if std_modelo.strip():
+                    new = pd.DataFrame([{"MODELO": std_modelo.strip(), "MINUTOS_STD": std_min}])
+                    if std_df.empty:
+                        std_df = new
+                    else:
+                        std_df = std_df[std_df["MODELO"].str.lower() != std_modelo.strip().lower()]
+                        std_df = pd.concat([std_df, new], ignore_index=True)
+                    save_model_std(std_df)
+                    st.success("Estándar guardado.")
+                    st.rerun()
+                else:
+                    st.error("Indica un modelo.")
+        with cc2:
+            st.download_button("⬇️ Descargar modelos_std.csv",
+                               data=std_df.to_csv(index=False).encode("utf-8"),
+                               file_name="modelos_std.csv", mime="text/csv", use_container_width=True)
+        with cc3:
+            up_std = st.file_uploader("Subir modelos_std.csv", type=["csv"], key="up_std_csv")
+            if up_std is not None:
+                try:
+                    dfu = pd.read_csv(up_std)
+                    save_model_std(dfu)
+                    st.success("Estándares cargados.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"CSV inválido: {e}")
+
+st.caption("©️ 2025 · Destajo móvil con horarios, tarifas por área, estándares por modelo, visor de PDFs, tablero y nómina comparativa.")
